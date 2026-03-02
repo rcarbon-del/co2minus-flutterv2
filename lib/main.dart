@@ -3,21 +3,17 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:provider/provider.dart';
 import 'user_provider.dart';
 import 'home_page.dart';
+import 'firebase_options.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
   
-  await Firebase.initializeApp(
-    options: const FirebaseOptions(
-      apiKey: "AIzaSyCJ8Xl1wEACNi9b-njB3k2uKY9Mk9aSH0U",
-      appId: "1:935965368269:web:587620ae15ceb711676e84",
-      messagingSenderId: "935965368269",
-      projectId: "co2-abvlnt",
-      authDomain: "co2-abvlnt.firebaseapp.com",
-      storageBucket: "co2-abvlnt.firebasestorage.app",
-      measurementId: "G-D2PGDK5M9J",
-    ),
-  );
+  // Using DefaultFirebaseOptions handles the [DEFAULT] app initialization correctly
+  if (Firebase.apps.isEmpty) {
+    await Firebase.initializeApp(
+      options: DefaultFirebaseOptions.currentPlatform,
+    );
+  }
 
   runApp(
     MultiProvider(
