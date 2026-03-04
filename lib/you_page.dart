@@ -59,17 +59,15 @@ class YouPage extends StatelessWidget {
                           child: BackdropFilter(
                             filter: ImageFilter.blur(sigmaX: 15, sigmaY: 15),
                             child: FlexibleSpaceBar(
-                              titlePadding: const EdgeInsets.only(left: 24, bottom: 16),
+                              titlePadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 16),
                               centerTitle: false,
-                              expandedTitleScale: 1.3,
                               title: Text(
-                                'You',
+                                'Profile',
                                 style: Theme.of(context).textTheme.displayMedium?.copyWith(
-                                      fontSize: 28,
-                                      fontWeight: FontWeight.bold,
-                                      color: brandNavy,
-                                      height: 1.0,
-                                    ),
+                                  fontSize: 28,
+                                  fontWeight: FontWeight.bold,
+                                  color: brandNavy,
+                                ),
                               ),
                             ),
                           ),
@@ -95,7 +93,7 @@ class YouPage extends StatelessWidget {
               // Profile Section - Isolated for performance
               SliverToBoxAdapter(
                 child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 24.0, vertical: 32.0),
+                  padding: const EdgeInsets.fromLTRB(24.0, 16.0, 24.0, 32.0),
                   child: RepaintBoundary(
                     child: Stack(
                       alignment: Alignment.topCenter,
@@ -345,7 +343,7 @@ class _LiquidGlassTile extends StatelessWidget {
             padding: const EdgeInsets.all(20),
             decoration: BoxDecoration(
               // Performance Optimization: Replaced BackdropFilter with high-fidelity smoked gradient.
-              color: brandNavy.withOpacity(0.25), 
+              color: brandNavy.withOpacity(0.25),
               borderRadius: BorderRadius.circular(28),
               border: Border.all(
                 color: Colors.white.withOpacity(0.25),

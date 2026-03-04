@@ -317,7 +317,7 @@ class _SummaryTile extends StatelessWidget {
                 fontWeight: FontWeight.w600,
               ),
               children: [
-                const TextSpan(text: "CO"),
+                const TextSpan(text: "CO", style: TextStyle(fontWeight: FontWeight.bold, fontFamily: 'MiSans')),
                 WidgetSpan(
                   child: Transform.translate(
                     offset: const Offset(0, 4),
@@ -331,7 +331,7 @@ class _SummaryTile extends StatelessWidget {
                     ),
                   ),
                 ),
-                const TextSpan(text: " saved"),
+                const TextSpan(text: " saved", style: TextStyle(fontWeight: FontWeight.bold, fontFamily: 'MiSans')),
               ],
             ),
           ),
@@ -408,7 +408,7 @@ class _GoalTile extends StatelessWidget {
                               "85.3",
                               style: TextStyle(
                                 fontWeight: FontWeight.w900,
-                                fontSize: 32,
+                                fontSize: 40,
                                 color: brandNavy,
                               ),
                             ),
@@ -417,7 +417,7 @@ class _GoalTile extends StatelessWidget {
                             "kg of 150",
                             style: TextStyle(
                               color: Color(0xB32D3E50),
-                              fontSize: 12,
+                              fontSize: 20,
                               fontWeight: FontWeight.w600,
                             ),
                           ),
@@ -451,71 +451,72 @@ class _LiquidGlassTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     const Color brandNavy = Color(0xFF2D3E50);
-    return RepaintBoundary(
+    return Container(
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(28),
+        boxShadow: [
+          BoxShadow(
+            color: brandNavy.withOpacity(0.08),
+            blurRadius: 20,
+            offset: const Offset(0, 8),
+          ),
+        ],
+      ),
       child: Container(
+        padding: const EdgeInsets.all(20),
         decoration: BoxDecoration(
+          color: brandNavy.withOpacity(0.2),
           borderRadius: BorderRadius.circular(28),
-          boxShadow: [
-            BoxShadow(
-              color: brandNavy.withOpacity(0.08),
-              blurRadius: 20,
-              offset: const Offset(0, 8),
-            ),
-          ],
+          border: Border.all(
+            color: Colors.white.withOpacity(0.25),
+            width: 1.0,
+          ),
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              brandNavy.withOpacity(0.25),
+              brandNavy.withOpacity(0.05),
+              accentColor.withOpacity(0.1),
+            ],
+          ),
         ),
-        child: Container(
-          padding: const EdgeInsets.all(20),
-          decoration: BoxDecoration(
-            color: brandNavy.withOpacity(0.25),
-            borderRadius: BorderRadius.circular(28),
-            border: Border.all(
-              color: Colors.white.withOpacity(0.25),
-              width: 1.0,
-            ),
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [
-                brandNavy.withOpacity(0.35),
-                brandNavy.withOpacity(0.1),
-                accentColor.withOpacity(0.15),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                FaIcon(icon, size: 20, color: brandNavy.withOpacity(0.8)),
+                // Fixed: Removed 'const' to allow dynamic color method invocation
+                Icon(Icons.north_east, size: 14, color: brandNavy.withOpacity(0.4)),
               ],
             ),
-          ),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  FaIcon(icon, size: 20, color: brandNavy.withOpacity(0.8)),
-                  const Icon(Icons.north_east, size: 14, color: Color(0x662D3E50)),
-                ],
-              ),
-              const Spacer(),
-              FittedBox(
+            const Spacer(),
+            Expanded(
+              child: FittedBox(
                 fit: BoxFit.contain,
                 alignment: Alignment.centerLeft,
                 child: Text(
-                  value,
+                  value, 
                   style: const TextStyle(
                     fontWeight: FontWeight.w900,
                     color: brandNavy,
                   ),
                 ),
               ),
-              const SizedBox(height: 2),
-              Text(
-                title.toUpperCase(),
-                style: const TextStyle(
-                  color: Color(0x802D3E50),
-                  fontSize: 11,
-                  fontWeight: FontWeight.w800,
-                  letterSpacing: 0.5,
-                ),
+            ),
+            const SizedBox(height: 2),
+            Text(
+              title.toUpperCase(),
+              style: const TextStyle(
+                color: Color(0x802D3E50),
+                fontSize: 11,
+                fontWeight: FontWeight.w800,
+                letterSpacing: 0.5,
               ),
-            ],
-          ),
+            ),
+          ],
         ),
       ),
     );

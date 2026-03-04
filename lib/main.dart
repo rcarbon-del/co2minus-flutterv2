@@ -50,17 +50,8 @@ class MyApp extends StatelessWidget {
           seedColor: const Color(0xFF2D3E50),
           brightness: Brightness.light,
         ),
-        // Ensure that individual AppBars don't override the system overlay style
-        appBarTheme: const AppBarTheme(
-          systemOverlayStyle: SystemUiOverlayStyle(
-            statusBarColor: Colors.transparent,
-            statusBarIconBrightness: Brightness.dark,
-            statusBarBrightness: Brightness.light,
-            systemNavigationBarColor: Colors.transparent,
-            systemNavigationBarIconBrightness: Brightness.dark,
-            systemNavigationBarDividerColor: Colors.transparent,
-          ),
-        ),
+        // Applying MiSans as the default font family
+        fontFamily: 'MiSans',
         textTheme: const TextTheme(
           displayMedium: TextStyle(
             fontSize: 34,
@@ -71,6 +62,17 @@ class MyApp extends StatelessWidget {
             fontSize: 20,
             fontWeight: FontWeight.w600,
             color: Color(0xFF5A5A5A),
+          ),
+        ),
+        // Ensure that individual AppBars don't override the system overlay style
+        appBarTheme: const AppBarTheme(
+          systemOverlayStyle: SystemUiOverlayStyle(
+            statusBarColor: Colors.transparent,
+            statusBarIconBrightness: Brightness.dark,
+            statusBarBrightness: Brightness.light,
+            systemNavigationBarColor: Colors.transparent,
+            systemNavigationBarIconBrightness: Brightness.dark,
+            systemNavigationBarDividerColor: Colors.transparent,
           ),
         ),
       ),

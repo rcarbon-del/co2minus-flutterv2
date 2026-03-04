@@ -28,3 +28,23 @@ flutter:
   uses-material-design: true
   assets:
     - assets/images/background.png
+  fonts:
+    - family: MiSans
+      fonts:
+        - asset: assets/fonts/MiSans/MiSans-Regular.otf
+        - asset: assets/fonts/MiSans/MiSans-Thin.otf
+          weight: 100
+        - asset: assets/fonts/MiSans/MiSans-ExtraLight.otf
+          weight: 200
+        - asset: assets/fonts/MiSans/MiSans-Light.otf
+          weight: 300
+        - asset: assets/fonts/MiSans/MiSans-Normal.otf
+          weight: 400
+        - asset: assets/fonts/MiSans/MiSans-Medium.otf
+          weight: 500
+        - asset: assets/fonts/MiSans/MiSans-Demibold.otf
+          weight: 600 # Or Semibold, you can choose which to map here
+        - asset: assets/fonts/MiSans/MiSans-Bold.otf
+          weight: 700
+        - asset: assets/fonts/MiSans/MiSans-Heavy.otf
+          weight: 800
