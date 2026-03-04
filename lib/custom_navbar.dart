@@ -130,68 +130,79 @@ class _CustomNavBarState extends State<CustomNavBar> {
                 alignment: Alignment.center,
                 clipBehavior: Clip.none,
                 children: [
-                  CustomPaint(
-                    painter: NavbarShadowPainter(clipper: NotchClipper()),
-                    size: Size(fullWidth, barHeight),
-                  ),
-                  ClipPath(
-                    clipper: NotchClipper(),
-                    child: BackdropFilter(
-                      filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
-                      child: CustomPaint(
-                        painter: NavbarBackgroundPainter(
-                          color: const Color(0xFFC8FFB0).withValues(alpha: 0.75),
-                          borderColor: Colors.white.withValues(alpha: 0.4),
-                          clipper: NotchClipper(),
+                  // Navbar Container with elevation shadow
+                  Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(40),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.1),
+                          blurRadius: 25,
+                          offset: const Offset(0, 10),
                         ),
-                        child: SizedBox(
-                          width: fullWidth,
-                          height: barHeight,
-                          child: Stack(
-                            children: [
-                              AnimatedPositioned(
-                                // Use 400ms for the jump on tap down, but 60ms for fluid following during drag
-                                duration: _isPanning
-                                    ? const Duration(milliseconds: 60)
-                                    : const Duration(milliseconds: 400),
-                                curve: Curves.fastOutSlowIn,
-                                left: currentBubbleLeft + bubbleInset,
-                                top: bubbleInset - 1,
-                                bottom: bubbleInset + 1,
-                                width: baseBubbleWidth - (bubbleInset * 2),
-                                child: Container(
-                                  decoration: BoxDecoration(
-                                    borderRadius: BorderRadius.circular(32),
-                                    gradient: LinearGradient(
-                                      begin: Alignment.topLeft,
-                                      end: Alignment.bottomRight,
-                                      colors: [
-                                        brandNavy.withValues(alpha: 0.32),
-                                        brandNavy.withValues(alpha: 0.18),
-                                        brandNavy.withValues(alpha: 0.1),
-                                      ],
-                                      stops: const [0.0, 0.5, 1.0],
-                                    ),
-                                    border: Border.all(
-                                      color: Colors.white.withValues(alpha: 0.12),
-                                      width: 1.0,
+                      ],
+                    ),
+                    child: ClipRRect(
+                      borderRadius: BorderRadius.circular(40),
+                      child: ClipPath(
+                        clipper: NotchClipper(),
+                        child: BackdropFilter(
+                          filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                          child: CustomPaint(
+                            painter: NavbarBackgroundPainter(
+                              color: const Color(0xFFC8FFB0).withValues(alpha: 0.75),
+                              borderColor: Colors.white.withValues(alpha: 0.4),
+                              clipper: NotchClipper(),
+                            ),
+                            child: SizedBox(
+                              width: fullWidth,
+                              height: barHeight,
+                              child: Stack(
+                                children: [
+                                  AnimatedPositioned(
+                                    duration: _isPanning
+                                        ? const Duration(milliseconds: 60)
+                                        : const Duration(milliseconds: 400),
+                                    curve: Curves.fastOutSlowIn,
+                                    left: currentBubbleLeft + bubbleInset,
+                                    top: bubbleInset - 1,
+                                    bottom: bubbleInset + 1,
+                                    width: baseBubbleWidth - (bubbleInset * 2),
+                                    child: Container(
+                                      decoration: BoxDecoration(
+                                        borderRadius: BorderRadius.circular(32),
+                                        gradient: LinearGradient(
+                                          begin: Alignment.topLeft,
+                                          end: Alignment.bottomRight,
+                                          colors: [
+                                            brandNavy.withValues(alpha: 0.32),
+                                            brandNavy.withValues(alpha: 0.18),
+                                            brandNavy.withValues(alpha: 0.1),
+                                          ],
+                                          stops: const [0.0, 0.5, 1.0],
+                                        ),
+                                        border: Border.all(
+                                          color: Colors.white.withValues(alpha: 0.12),
+                                          width: 1.0,
+                                        ),
+                                      ),
                                     ),
                                   ),
-                                ),
+                                  Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: horizontalPadding),
+                                    child: Row(
+                                      children: [
+                                        _buildNavIcon(FontAwesomeIcons.house, 0, focalX, itemWidth),
+                                        _buildNavIcon(FontAwesomeIcons.bookBookmark, 1, focalX, itemWidth),
+                                        const SizedBox(width: spacerWidth),
+                                        _buildNavIcon(FontAwesomeIcons.calculator, 2, focalX, itemWidth),
+                                        _buildNavIcon(FontAwesomeIcons.solidUser, 3, focalX, itemWidth),
+                                      ],
+                                    ),
+                                  ),
+                                ],
                               ),
-                              Padding(
-                                padding: const EdgeInsets.symmetric(horizontal: horizontalPadding),
-                                child: Row(
-                                  children: [
-                                    _buildNavIcon(FontAwesomeIcons.house, 0, focalX, itemWidth),
-                                    _buildNavIcon(FontAwesomeIcons.bookBookmark, 1, focalX, itemWidth),
-                                    const SizedBox(width: spacerWidth),
-                                    _buildNavIcon(FontAwesomeIcons.calculator, 2, focalX, itemWidth),
-                                    _buildNavIcon(FontAwesomeIcons.wallet, 3, focalX, itemWidth),
-                                  ],
-                                ),
-                              ),
-                            ],
+                            ),
                           ),
                         ),
                       ),
