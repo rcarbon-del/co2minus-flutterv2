@@ -73,7 +73,7 @@ class YouPage extends StatelessWidget {
                           ),
                         ),
                         Positioned(
-                          top: currentTop,
+                          top: currentTop + (10 * (1.0 - expandRatio)),
                           right: 24,
                           child: Transform.scale(
                             scale: 1.0 + (expandRatio * 0.3),
