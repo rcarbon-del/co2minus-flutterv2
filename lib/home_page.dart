@@ -4,6 +4,7 @@ import 'user_provider.dart';
 import 'custom_navbar.dart';
 import 'impact_page.dart';
 import 'you_page.dart';
+import 'library_page.dart';
 
 class MyHomePage extends StatefulWidget {
   const MyHomePage({super.key});
@@ -179,7 +180,7 @@ class _MyHomePageState extends State<MyHomePage> {
             index: _selectedIndex,
             children: [
               const _CustomHomeBody(), // Index 0: Home
-              const Center(child: Text("Library Page")), // Index 1: Library
+              const LibraryPage(), // Index 1: Library
               const ImpactPage(), // Index 2: Impact (Calculator Icon)
               const YouPage(), // Index 3: You (Person Icon)
             ],

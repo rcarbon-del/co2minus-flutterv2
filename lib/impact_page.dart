@@ -408,7 +408,7 @@ class _GoalTile extends StatelessWidget {
                               "85.3",
                               style: TextStyle(
                                 fontWeight: FontWeight.w900,
-                                fontSize: 40,
+                                fontSize: 30,
                                 color: brandNavy,
                               ),
                             ),
@@ -417,7 +417,7 @@ class _GoalTile extends StatelessWidget {
                             "kg of 150",
                             style: TextStyle(
                               color: Color(0xB32D3E50),
-                              fontSize: 20,
+                              fontSize: 14,
                               fontWeight: FontWeight.w600,
                             ),
                           ),

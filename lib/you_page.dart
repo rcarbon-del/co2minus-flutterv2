@@ -52,6 +52,7 @@ class YouPage extends StatelessWidget {
                     final double expandedCenterY = expandedHeight - 16 - 18.2; 
                     final double currentCenterY = collapsedCenterY + (expandRatio * (expandedCenterY - collapsedCenterY));
                     final double currentTop = currentCenterY - 24;
+                    final double expandedDropOffset = 50.0;
 
                     return Stack(
                       children: [
@@ -73,7 +74,7 @@ class YouPage extends StatelessWidget {
                           ),
                         ),
                         Positioned(
-                          top: currentTop + (10 * (1.0 - expandRatio)),
+                          top: currentTop - 20 + (expandedDropOffset * expandRatio),
                           right: 24,
                           child: Transform.scale(
                             scale: 1.0 + (expandRatio * 0.3),

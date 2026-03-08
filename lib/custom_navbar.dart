@@ -1,6 +1,7 @@
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'scanner_page.dart';
 
 class CustomNavBar extends StatefulWidget {
   final int selectedIndex;
@@ -210,7 +211,15 @@ class _CustomNavBarState extends State<CustomNavBar> {
                   ),
                   Positioned(
                     top: -42,
-                    child: _buildScanButton(),
+                    child: GestureDetector(
+                      onTap: () {
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (context) => const ScannerPage()),
+                        );
+                      },
+                      child: _buildScanButton(),
+                    ),
                   ),
                 ],
               ),
