@@ -2,19 +2,14 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart'; // Added for MethodChannel
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
-import 'package:image/image.dart' as img; // Added for YOLO Tensor Preprocessing
-
-// AR Plugin imports for hit-testing math
-import 'package:ar_flutter_plugin/ar_flutter_plugin.dart';
-import 'package:ar_flutter_plugin/managers/ar_session_manager.dart';
-import 'package:ar_flutter_plugin/models/ar_hittest_result.dart';
-import 'package:vector_math/vector_math_64.dart' as vector;
+import 'package:image/image.dart' as img;
 
 import 'user_provider.dart';
 import 'services/carbon_estimator_service.dart';
@@ -35,6 +30,9 @@ class ScannerPage extends StatefulWidget {
 }
 
 class _ScannerPageState extends State<ScannerPage> {
+  // Method Channel to communicate with Native Kotlin AR
+  static const platform = MethodChannel('co2minus.app/ar_depth');
+
   CameraController? _controller;
   bool _isFlashOn = false;
   bool _isInitialized = false;
@@ -43,7 +41,6 @@ class _ScannerPageState extends State<ScannerPage> {
   final TextRecognizer _textRecognizer = TextRecognizer();
   final CarbonEstimatorService _carbonService = CarbonEstimatorService();
   Interpreter? _yoloInterpreter;
-  ARSessionManager? _arSessionManager; // Hook for AR Failsafe
 
   // YOLO Classes from data.yaml
   final List<String> _yoloLabels = [
@@ -58,8 +55,10 @@ class _ScannerPageState extends State<ScannerPage> {
   String _detectedClass = "";
   double _carbonFootprint = 0.0;
 
-  // Stream for the Processing Dialog
+  // Stream & History for the Processing Dialog
   StreamController<PipelineUpdate>? _pipelineController;
+  final List<PipelineUpdate> _pipelineHistory = [];
+  int _currentPipelineProgress = 0;
 
   @override
   void initState() {
@@ -124,8 +123,12 @@ class _ScannerPageState extends State<ScannerPage> {
   }
 
   void _emitUpdate(int progress, String step, String detail) {
+    final update = PipelineUpdate(progress, step, detail);
+    _pipelineHistory.insert(0, update); // Cache for dialog restoration
+    _currentPipelineProgress = progress;
+
     if (_pipelineController != null && !_pipelineController!.isClosed) {
-      _pipelineController!.add(PipelineUpdate(progress, step, detail));
+      _pipelineController!.add(update);
     }
   }
 
@@ -134,7 +137,6 @@ class _ScannerPageState extends State<ScannerPage> {
     if (_yoloInterpreter == null) return null;
 
     try {
-      // 1. Image Preprocessing (Convert JPEG to 640x640x3 RGB Float32 Tensor)
       final bytes = await File(imagePath).readAsBytes();
       img.Image? decodedImage = img.decodeImage(bytes);
       if (decodedImage == null) return null;
@@ -151,19 +153,15 @@ class _ScannerPageState extends State<ScannerPage> {
         }
       }
 
-      // 2. Output Tensor Initialization (Standard YOLOv8 Output shape: 1 batch, 14 dims (4 box + 10 classes), 8400 proposals)
       var output = List.generate(1, (i) => List.generate(14, (j) => List.filled(8400, 0.0)));
-
-      // 3. Run Inference
       _yoloInterpreter!.run(input, output);
 
-      // 4. Output Parsing & ArgMax
       double maxConfidence = 0.0;
       int bestClassIndex = -1;
 
       for (int p = 0; p < 8400; p++) {
         for (int c = 0; c < 10; c++) {
-          double confidence = output[0][c + 4][p]; // Class confidences start at index 4
+          double confidence = output[0][c + 4][p];
           if (confidence > maxConfidence) {
             maxConfidence = confidence;
             bestClassIndex = c;
@@ -171,7 +169,6 @@ class _ScannerPageState extends State<ScannerPage> {
         }
       }
 
-      // Confidence Threshold
       if (maxConfidence > 0.45 && bestClassIndex != -1) {
         return _yoloLabels[bestClassIndex];
       }
@@ -182,89 +179,104 @@ class _ScannerPageState extends State<ScannerPage> {
     }
   }
 
-  // --- AR VOLUMETRIC FAILSAFE ---
-  // Calculates expected weight based on device depth sensors and item density
+  // --- NATIVE AR VOLUMETRIC FAILSAFE ---
   Future<double> _estimateWeightViaAR(String detectedClass) async {
     double depthToItemCm = 30.0; // Default fallback baseline distance
 
-    // Exact hook for ARCore/ARKit hit-testing to get real physical depth
-    if (_arSessionManager != null) {
-      try {
-        // ar_flutter_plugin handles hit tests via the onPlaneOrPointTap callback
-        // rather than a programmatic hitTest method.
-        // We comment out the direct call to prevent compilation errors and simulate the delay.
-        /*
-        List<ARHitTestResult> hitTestResults = await _arSessionManager!.hitTest(
-          x: MediaQuery.of(context).size.width / 2,
-          y: MediaQuery.of(context).size.height / 2
-        );
+    _emitUpdate(70, "3. Volumetric Failsafe (AR)", "Missing weight. Handing off to Native AR Lens...");
 
-        if (hitTestResults.isNotEmpty) {
-          // Extract translation vector from the hit test transform matrix
-          vector.Matrix4 transform = hitTestResults.first.worldTransform;
-          vector.Vector3 translation = transform.getTranslation();
-          depthToItemCm = translation.length * 100; // Convert depth from meters to centimeters
-        }
-        */
+    // 1. Hardware Handoff: Free camera hardware for Native Android
+    await _controller?.dispose();
+    _controller = null;
 
-        await Future.delayed(const Duration(milliseconds: 1000));
-        _emitUpdate(75, "3. Volumetric Failsafe (AR)", "Hit Test surface simulated at ${depthToItemCm.toStringAsFixed(1)} cm");
-
-      } catch (e) {
-        debugPrint("AR Hit Test Failed: $e");
-      }
-    } else {
-      await Future.delayed(const Duration(milliseconds: 1500)); // Simulating scan if ARView is hidden
+    // 2. Unblock UI: Hide processing dialog temporarily so user can see native AR view
+    if (mounted && _isDialogShowing) {
+      Navigator.pop(context);
+      _isDialogShowing = false;
     }
 
-    // Baseline Bounding Box Dimensions at 30cm depth (in cm)
+    // 3. Trigger Native Kotlin Method Channel
+    try {
+      // This suspends Flutter and opens the Android Kotlin Activity
+      final double? result = await platform.invokeMethod('measureDepth');
+
+      if (result != null && result > 0) {
+        depthToItemCm = result;
+        _emitUpdate(75, "3. Volumetric Failsafe (AR)", "Target locked via Native AR Tap at ${depthToItemCm.toStringAsFixed(1)} cm");
+      } else {
+        _emitUpdate(75, "3. Volumetric Failsafe (AR)", "AR tap aborted. Using 30cm baseline.");
+      }
+    } on PlatformException catch (e) {
+      debugPrint("Native AR Error: ${e.message}");
+      _emitUpdate(75, "3. Volumetric Failsafe (AR)", "Native AR sensor failed. Using 30cm baseline.");
+    }
+
+    // 4. Restore Standard Camera
+    if (mounted) {
+      setState(() { _isInitialized = false; });
+      await _initializeCamera();
+    }
+
+    // 5. Restore Processing Dialog without losing history
+    if (mounted && !_isDialogShowing) {
+      _isDialogShowing = true;
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => _ProcessingDialog(
+          updateStream: _pipelineController!.stream,
+          initialLogs: _pipelineHistory,
+          initialProgress: _currentPipelineProgress,
+        ),
+      );
+    }
+
+    // --- EXACT VOLUMETRIC CALCULATIONS ---
     double widthCm = 0.0;
     double heightCm = 0.0;
     double depthCm = 0.0;
-
-    // Density mapping (grams per cubic centimeter)
     double densityGCm3 = 1.0;
 
     switch (detectedClass) {
       case "can_drink":
         widthCm = 6.6; heightCm = 12.2; depthCm = 6.6;
-        densityGCm3 = 1.0; // liquid
+        densityGCm3 = 1.0;
         break;
       case "can_food":
         widthCm = 8.5; heightCm = 11.0; depthCm = 8.5;
-        densityGCm3 = 1.0; // dense food
+        densityGCm3 = 1.0;
         break;
       case "cleaning_product":
         widthCm = 9.0; heightCm = 25.0; depthCm = 6.0;
-        densityGCm3 = 1.0; // liquid soap/detergent
+        densityGCm3 = 1.0;
         break;
       case "cooking_oil_bottle":
         widthCm = 8.0; heightCm = 24.0; depthCm = 8.0;
-        densityGCm3 = 0.92; // oil is slightly less dense than water
+        densityGCm3 = 0.92;
         break;
       case "instant_drink_sachet":
         widthCm = 8.0; heightCm = 10.0; depthCm = 0.5;
-        densityGCm3 = 0.6; // powder
+        densityGCm3 = 0.6;
         break;
       case "instant_noodles":
         widthCm = 10.0; heightCm = 10.0; depthCm = 4.0;
-        densityGCm3 = 0.2; // mostly air/dry noodles
+        densityGCm3 = 0.2;
         break;
       case "personal_care":
         widthCm = 6.0; heightCm = 18.0; depthCm = 4.0;
-        densityGCm3 = 1.0; // shampoo/lotion
+        densityGCm3 = 1.0;
         break;
       case "plastic-bottle":
         widthCm = 7.0; heightCm = 20.0; depthCm = 7.0;
-        densityGCm3 = 1.0; // water/soda
+        densityGCm3 = 1.0;
         break;
       case "rice_pack":
         widthCm = 15.0; heightCm = 20.0; depthCm = 5.0;
-        densityGCm3 = 0.8; // bulk density of rice
+        densityGCm3 = 0.8;
         break;
       case "snack_pack":
         widthCm = 15.0; heightCm = 20.0; depthCm = 5.0;
-        densityGCm3 = 0.1; // potato chips (mostly air)
+        densityGCm3 = 0.1;
         break;
       default:
         widthCm = 7.0; heightCm = 20.0; depthCm = 7.0;
@@ -272,21 +284,16 @@ class _ScannerPageState extends State<ScannerPage> {
         break;
     }
 
-    // Dynamic Volumetric Scaling:
-    // Objects further away appear smaller. We scale the baseline box by the depth distance factor.
+    // Dynamic Volumetric Scaling based on Native Depth
     double depthScaleFactor = depthToItemCm / 30.0;
     widthCm *= depthScaleFactor;
     heightCm *= depthScaleFactor;
     depthCm *= depthScaleFactor;
 
-    // Volume in cm^3
     double volumeCm3 = widthCm * heightCm * depthCm;
-
-    // Weight in grams = Volume * Density
     double weightGrams = volumeCm3 * densityGCm3;
 
-    // Convert to KG
-    return weightGrams / 1000.0;
+    return weightGrams / 1000.0; // Convert final to KG
   }
 
   Future<void> _runPipeline() async {
@@ -297,13 +304,18 @@ class _ScannerPageState extends State<ScannerPage> {
       _isDialogShowing = true;
     });
 
+    _pipelineHistory.clear();
+    _currentPipelineProgress = 0;
     _pipelineController = StreamController<PipelineUpdate>();
 
-    // Open Processing Dialog
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (context) => _ProcessingDialog(updateStream: _pipelineController!.stream),
+      builder: (context) => _ProcessingDialog(
+        updateStream: _pipelineController!.stream,
+        initialLogs: _pipelineHistory,
+        initialProgress: _currentPipelineProgress,
+      ),
     );
 
     try {
@@ -318,27 +330,24 @@ class _ScannerPageState extends State<ScannerPage> {
         _emitUpdate(10 + (i * 10), "1. Trigger & Identification (YOLO)", "Pass $i: Capturing & Analyzing frame...");
         finalImage = await _controller!.takePicture();
 
-        // Execute Live YOLO Tensor Math
         String? yoloResult = await _runYoloInference(finalImage.path);
 
         if (yoloResult != null) {
           isObjectDetected = true;
           currentDetectedClass = yoloResult;
         } else if (i == 3 && !isObjectDetected) {
-          // Fallback for simulation if model hasn't learned the environment yet
+          // Simulation Fallback
           isObjectDetected = true;
           currentDetectedClass = "plastic-bottle";
         }
       }
 
-      // Gatekeeper Check: Ensure object detection succeeded before allowing OCR
       if (!isObjectDetected || currentDetectedClass.isEmpty) {
         _emitUpdate(40, "1. Trigger & Identification (YOLO)", "Detection failed. No object found.");
         throw Exception("YOLO Object Detection Failed.");
       }
 
       _emitUpdate(40, "1. Trigger & Identification (YOLO)", "Classification Confirmed: $currentDetectedClass");
-
       if (finalImage == null) throw Exception("Failed to capture image");
 
       // STEP 2: OCR Data Extraction
@@ -347,10 +356,9 @@ class _ScannerPageState extends State<ScannerPage> {
       final RecognizedText recognizedText = await _textRecognizer.processImage(inputImage);
       String ocrText = recognizedText.text.replaceAll('\n', ' ').toLowerCase();
 
-      double detectedWeightKg = 0.5; // Default fallback
+      double detectedWeightKg = 0.5;
       bool ocrWeightFound = false;
 
-      // Try to extract Explicit Weight using Regex
       RegExp weightRegex = RegExp(r'(\d+(?:\.\d+)?)\s*(kg|g|ml|l)', caseSensitive: false);
       var match = weightRegex.firstMatch(ocrText);
       if (match != null) {
@@ -369,7 +377,6 @@ class _ScannerPageState extends State<ScannerPage> {
         }
       }
 
-      // Extract Brand
       List<String> knownBrands = ['nestle', 'coca-cola', 'coke', 'pepsi', 'unilever', 'p&g', 'monde', 'san miguel', 'urc', 'del monte', 'century', 'purefoods', 'oishi', 'jack n jill'];
       String detectedBrand = "Unknown";
       for (String brand in knownBrands) {
@@ -379,7 +386,6 @@ class _ScannerPageState extends State<ScannerPage> {
         }
       }
 
-      // Extract Specific Labels
       List<String> targetLabels = ['organic', 'recyclable', 'recycled', 'biodegradable', 'vegan', 'fair trade', 'sugar free', 'halal', 'fda approved'];
       List<String> foundLabels = [];
       for (String label in targetLabels) {
@@ -393,11 +399,10 @@ class _ScannerPageState extends State<ScannerPage> {
       String extText = "W: $weightDisplay | B: $detectedBrand \nLabels: $labelsDisplay";
 
       _emitUpdate(60, "2. Data Extraction (OCR)", extText);
-      await Future.delayed(const Duration(milliseconds: 1500)); // Increased delay so user can read the data
+      await Future.delayed(const Duration(milliseconds: 1500));
 
       // STEP 3: AR Volumetric Failsafe
       if (!ocrWeightFound) {
-        _emitUpdate(70, "3. Volumetric Failsafe (AR)", "Missing weight. Activating AR depth sensors...");
         detectedWeightKg = await _estimateWeightViaAR(currentDetectedClass);
         _emitUpdate(80, "3. Volumetric Failsafe (AR)", "Mapped physical volume. Estimated mass: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
       } else {
@@ -413,7 +418,6 @@ class _ScannerPageState extends State<ScannerPage> {
       bool isContradiction = false;
       String mismatchReason = "";
 
-      // Gatekeeper Logic: Cross-checking YOLO predicted class against OCR keywords
       if (currentDetectedClass.contains("drink") && (ocrText.contains("shampoo") || ocrText.contains("soap") || ocrText.contains("cleaner"))) {
         isContradiction = true; mismatchReason = "Detected Drink, but OCR read cleaning terms.";
       } else if (currentDetectedClass == "cleaning_product" && (ocrText.contains("drink") || ocrText.contains("juice") || ocrText.contains("food"))) {
@@ -437,7 +441,6 @@ class _ScannerPageState extends State<ScannerPage> {
 
       double? finalFootprint = await _carbonService.estimateFootprint(currentDetectedClass, detectedWeightKg);
 
-      // Fallback if the database throws an error or item isn't mapped
       if (finalFootprint == null || finalFootprint <= 0) {
         finalFootprint = 1.25;
       }
@@ -445,9 +448,10 @@ class _ScannerPageState extends State<ScannerPage> {
       _emitUpdate(100, "Sequence Complete", "Estimated Footprint: ${finalFootprint.toStringAsFixed(2)} kg CO2e");
       await Future.delayed(const Duration(milliseconds: 1000));
 
-      // Close Dialog and show success
       if (mounted) {
-        Navigator.pop(context);
+        if (_isDialogShowing) {
+          Navigator.pop(context);
+        }
         setState(() {
           _detectedClass = currentDetectedClass.replaceAll('_', ' ').toUpperCase();
           _carbonFootprint = finalFootprint!;
@@ -458,7 +462,10 @@ class _ScannerPageState extends State<ScannerPage> {
     } catch (e) {
       debugPrint("Pipeline Error: $e");
       if (mounted) {
-        Navigator.pop(context); // Close processing dialog
+        if (_isDialogShowing) {
+          Navigator.pop(context); // Safely close dialog only if it's currently showing
+          _isDialogShowing = false;
+        }
         _showFailurePopup();
       }
     } finally {
@@ -537,12 +544,11 @@ class _ScannerPageState extends State<ScannerPage> {
     );
   }
 
-  // Prevents the camera preview from stretching
+  // Prevents the standard camera preview from stretching
   Widget _buildCameraPreview() {
     final size = MediaQuery.of(context).size;
     var scale = size.aspectRatio * _controller!.value.aspectRatio;
 
-    // In portrait mode, the scale needs to be inverted to cover properly
     if (scale < 1) scale = 1 / scale;
 
     return Transform.scale(
@@ -563,8 +569,9 @@ class _ScannerPageState extends State<ScannerPage> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
+          // Base Layer: Camera View
           Positioned.fill(
-            child: _isInitialized
+            child: _isInitialized && _controller != null
                 ? _buildCameraPreview()
                 : Container(
               color: Colors.black,
@@ -699,8 +706,14 @@ class _ScannerPageState extends State<ScannerPage> {
 // ==========================================
 class _ProcessingDialog extends StatefulWidget {
   final Stream<PipelineUpdate> updateStream;
+  final List<PipelineUpdate> initialLogs;
+  final int initialProgress;
 
-  const _ProcessingDialog({required this.updateStream});
+  const _ProcessingDialog({
+    required this.updateStream,
+    this.initialLogs = const [],
+    this.initialProgress = 0,
+  });
 
   @override
   State<_ProcessingDialog> createState() => _ProcessingDialogState();
@@ -713,6 +726,9 @@ class _ProcessingDialogState extends State<_ProcessingDialog> {
   @override
   void initState() {
     super.initState();
+    _currentProgress = widget.initialProgress;
+    _logs.addAll(widget.initialLogs);
+
     widget.updateStream.listen((update) {
       if (mounted) {
         setState(() {
@@ -792,7 +808,6 @@ class _ProcessingDialogState extends State<_ProcessingDialog> {
                 itemCount: _logs.length,
                 itemBuilder: (context, index) {
                   final log = _logs[index];
-                  // Top log is highlighted
                   final bool isLatest = index == 0;
 
                   return Padding(
