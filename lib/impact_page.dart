@@ -2,6 +2,9 @@ import 'dart:math' as math;
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:provider/provider.dart';
+import 'user_provider.dart';
+import 'scanner_page.dart';
 
 class ImpactPage extends StatefulWidget {
   const ImpactPage({super.key});
@@ -15,6 +18,7 @@ class _ImpactPageState extends State<ImpactPage> {
   Widget build(BuildContext context) {
     const Color brandNavy = Color(0xFF2D3E50);
     const Color brandGreen = Color(0xFFC8FFB0);
+    final userProvider = Provider.of<UserProvider>(context);
 
     return Scaffold(
       backgroundColor: Colors.transparent,
@@ -53,8 +57,9 @@ class _ImpactPageState extends State<ImpactPage> {
                         'Impact',
                         style: Theme.of(context).textTheme.displayMedium?.copyWith(
                               fontSize: 28,
-                              fontWeight: FontWeight.bold,
+                              fontWeight: FontWeight.w900,
                               color: brandNavy,
+                              letterSpacing: -0.5,
                             ),
                       ),
                     ),
@@ -73,8 +78,13 @@ class _ImpactPageState extends State<ImpactPage> {
                     childAspectRatio: 0.9,
                   ),
                   delegate: SliverChildListDelegate([
-                    const RepaintBoundary(child: _SummaryTile()),
-                    const RepaintBoundary(child: _GoalTile()),
+                    _SummaryTile(
+                      dailyImpact: userProvider.dailyImpact,
+                      previousDayImpact: userProvider.previousDayImpact,
+                    ),
+                    _GoalTile(
+                      monthlyImpact: userProvider.monthlyImpact,
+                    ),
                   ]),
                 ),
               ),
@@ -85,7 +95,7 @@ class _ImpactPageState extends State<ImpactPage> {
                   child: Text(
                     "Today's Breakdown",
                     style: TextStyle(
-                      fontWeight: FontWeight.bold,
+                      fontWeight: FontWeight.w900,
                       color: brandNavy,
                       fontSize: 20,
                     ),
@@ -104,10 +114,30 @@ class _ImpactPageState extends State<ImpactPage> {
                     childAspectRatio: 1.1,
                   ),
                   delegate: SliverChildListDelegate([
-                    const _LiquidGlassTile(title: "Transport", value: "3.2 kg", icon: FontAwesomeIcons.carSide, accentColor: brandGreen),
-                    const _LiquidGlassTile(title: "Energy", value: "1.8 kg", icon: FontAwesomeIcons.bolt, accentColor: Color(0xFFFFF59D)),
-                    const _LiquidGlassTile(title: "Food", value: "2.5 kg", icon: FontAwesomeIcons.utensils, accentColor: Color(0xFFFFCC80)),
-                    const _LiquidGlassTile(title: "Shopping", value: "0.9 kg", icon: FontAwesomeIcons.bagShopping, accentColor: Color(0xFF90CAF9)),
+                    _LiquidGlassTile(
+                      title: "Transport", 
+                      value: "${userProvider.transportImpact.toStringAsFixed(1)} kg", 
+                      icon: FontAwesomeIcons.carSide, 
+                      accentColor: brandGreen
+                    ),
+                    _LiquidGlassTile(
+                      title: "Energy", 
+                      value: "${userProvider.energyImpact.toStringAsFixed(1)} kg", 
+                      icon: FontAwesomeIcons.bolt, 
+                      accentColor: const Color(0xFFFFF59D)
+                    ),
+                    _LiquidGlassTile(
+                      title: "Food", 
+                      value: "0.0 kg", 
+                      icon: FontAwesomeIcons.utensils, 
+                      accentColor: const Color(0xFFFFCC80)
+                    ),
+                    _LiquidGlassTile(
+                      title: "Shopping", 
+                      value: "${userProvider.shoppingImpact.toStringAsFixed(1)} kg", 
+                      icon: FontAwesomeIcons.bagShopping, 
+                      accentColor: const Color(0xFF90CAF9)
+                    ),
                   ]),
                 ),
               ),
@@ -179,7 +209,17 @@ class _ExpandableFabMenuState extends State<_ExpandableFabMenu> with SingleTicke
         children: [
           _buildFabMenuItem(icon: Icons.add_rounded, label: "Add", index: 3),
           const SizedBox(height: 16),
-          _buildFabMenuItem(icon: FontAwesomeIcons.expand, label: "Scan", index: 2),
+          _buildFabMenuItem(
+            icon: FontAwesomeIcons.expand, 
+            label: "Scan", 
+            index: 2,
+            onTap: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (context) => const ScannerPage()),
+              );
+            },
+          ),
           const SizedBox(height: 16),
           _buildFabMenuItem(icon: Icons.map_outlined, label: "Locate", index: 1),
           const SizedBox(height: 16),
@@ -196,7 +236,7 @@ class _ExpandableFabMenuState extends State<_ExpandableFabMenu> with SingleTicke
                 shape: BoxShape.circle,
                 boxShadow: [
                   BoxShadow(
-                    color: widget.brandNavy.withOpacity(0.2),
+                    color: widget.brandNavy.withValues(alpha: 0.2),
                     blurRadius: 12,
                     offset: const Offset(0, 6),
                   ),
@@ -219,7 +259,7 @@ class _ExpandableFabMenuState extends State<_ExpandableFabMenu> with SingleTicke
     );
   }
 
-  Widget _buildFabMenuItem({required IconData icon, required String label, required int index}) {
+  Widget _buildFabMenuItem({required IconData icon, required String label, required int index, VoidCallback? onTap}) {
     final staggerAnimation = CurvedAnimation(
       parent: _animationController,
       curve: Interval(0.1 * index, 0.6 + (0.1 * index), curve: Curves.easeOutBack),
@@ -227,34 +267,42 @@ class _ExpandableFabMenuState extends State<_ExpandableFabMenu> with SingleTicke
 
     return FadeTransition(
       opacity: staggerAnimation,
-      child: ScaleTransition(
-        scale: staggerAnimation,
-        child: SlideTransition(
-          position: Tween<Offset>(begin: const Offset(0, 0.5), end: Offset.zero).animate(staggerAnimation),
-          child: Container(
-            margin: const EdgeInsets.only(right: 4),
-            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-            decoration: BoxDecoration(
-              color: widget.brandNavy,
-              borderRadius: BorderRadius.circular(32),
-              boxShadow: [
-                BoxShadow(
-                  color: widget.brandNavy.withOpacity(0.3),
-                  blurRadius: 8,
-                  offset: const Offset(0, 4),
-                ),
-              ],
-            ),
-            child: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                FaIcon(icon, size: 18, color: widget.brandGreen.withOpacity(0.9)),
-                const SizedBox(width: 12),
-                Text(
-                  label,
-                  style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
-                ),
-              ],
+      child: GestureDetector(
+        onTap: () {
+          if (onTap != null) {
+            _toggleMenu();
+            onTap();
+          }
+        },
+        child: ScaleTransition(
+          scale: staggerAnimation,
+          child: SlideTransition(
+            position: Tween<Offset>(begin: const Offset(0, 0.5), end: Offset.zero).animate(staggerAnimation),
+            child: Container(
+              margin: const EdgeInsets.only(right: 4),
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+              decoration: BoxDecoration(
+                color: widget.brandNavy,
+                borderRadius: BorderRadius.circular(32),
+                boxShadow: [
+                  BoxShadow(
+                    color: widget.brandNavy.withValues(alpha: 0.3),
+                    blurRadius: 8,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  FaIcon(icon, size: 18, color: widget.brandGreen.withValues(alpha: 0.9)),
+                  const SizedBox(width: 12),
+                  Text(
+                    label,
+                    style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 16),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
@@ -264,19 +312,34 @@ class _ExpandableFabMenuState extends State<_ExpandableFabMenu> with SingleTicke
 }
 
 class _SummaryTile extends StatelessWidget {
-  const _SummaryTile();
+  final double dailyImpact;
+  final double previousDayImpact;
+
+  const _SummaryTile({
+    required this.dailyImpact,
+    required this.previousDayImpact,
+  });
 
   @override
   Widget build(BuildContext context) {
     const Color brandNavy = Color(0xFF2D3E50);
+    
+    // Calculate percentage as requested: daily / (prev or 1)
+    final double divisor = previousDayImpact > 0 ? previousDayImpact : 1.0;
+    final double ratio = dailyImpact / divisor;
+    final int percentage = (ratio * 100).toInt();
+    
+    // Logic: If daily > prev, it's an increase (up arrow, red color)
+    final bool isIncrease = dailyImpact > previousDayImpact;
+
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.9),
+        color: Colors.white.withValues(alpha: 0.9),
         borderRadius: BorderRadius.circular(28),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.03),
+            color: Colors.black.withValues(alpha: 0.03),
             blurRadius: 20,
             offset: const Offset(0, 10),
           ),
@@ -295,13 +358,13 @@ class _SummaryTile extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 16),
-          const Expanded(
+          Expanded(
             child: FittedBox(
               fit: BoxFit.contain,
               alignment: Alignment.centerLeft,
               child: Text(
-                "0.2 kg",
-                style: TextStyle(
+                "${dailyImpact.toStringAsFixed(2)} kg",
+                style: const TextStyle(
                   fontWeight: FontWeight.w900,
                   color: brandNavy,
                 ),
@@ -331,16 +394,16 @@ class _SummaryTile extends StatelessWidget {
                     ),
                   ),
                 ),
-                const TextSpan(text: " saved", style: TextStyle(fontWeight: FontWeight.bold, fontFamily: 'MiSans')),
+                const TextSpan(text: " emissions", style: TextStyle(fontWeight: FontWeight.bold, fontFamily: 'MiSans')),
               ],
             ),
           ),
           const SizedBox(height: 8),
           Text(
-            "↓ 12%",
+            "${isIncrease ? '↑' : '↓'} $percentage%",
             style: TextStyle(
-              color: Colors.green.shade600,
-              fontWeight: FontWeight.bold,
+              color: isIncrease ? Colors.red.shade600 : Colors.green.shade600,
+              fontWeight: FontWeight.w900,
               fontSize: 18,
             ),
           ),
@@ -351,20 +414,24 @@ class _SummaryTile extends StatelessWidget {
 }
 
 class _GoalTile extends StatelessWidget {
-  const _GoalTile();
+  final double monthlyImpact;
+
+  const _GoalTile({required this.monthlyImpact});
 
   @override
   Widget build(BuildContext context) {
     const Color brandNavy = Color(0xFF2D3E50);
-    const double progress = 0.57;
+    const double goal = 150.0;
+    final double progress = (monthlyImpact / goal).clamp(0.0, 1.0);
+
     return Container(
       padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        color: Colors.white.withOpacity(0.9),
+        color: Colors.white.withValues(alpha: 0.9),
         borderRadius: BorderRadius.circular(28),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.03),
+            color: Colors.black.withValues(alpha: 0.03),
             blurRadius: 20,
             offset: const Offset(0, 10),
           ),
@@ -396,7 +463,7 @@ class _GoalTile extends StatelessWidget {
                         painter: SpeedometerPainter(
                           progress: progress,
                           color: brandNavy,
-                          backgroundColor: brandNavy.withOpacity(0.1),
+                          backgroundColor: brandNavy.withValues(alpha: 0.1),
                         ),
                       ),
                       Column(
@@ -405,8 +472,8 @@ class _GoalTile extends StatelessWidget {
                           FittedBox(
                             fit: BoxFit.contain,
                             child: Text(
-                              "85.3",
-                              style: TextStyle(
+                              monthlyImpact.toStringAsFixed(1),
+                              style: const TextStyle(
                                 fontWeight: FontWeight.w900,
                                 fontSize: 30,
                                 color: brandNavy,
@@ -456,7 +523,7 @@ class _LiquidGlassTile extends StatelessWidget {
         borderRadius: BorderRadius.circular(28),
         boxShadow: [
           BoxShadow(
-            color: brandNavy.withOpacity(0.08),
+            color: brandNavy.withValues(alpha: 0.08),
             blurRadius: 20,
             offset: const Offset(0, 8),
           ),
@@ -465,19 +532,19 @@ class _LiquidGlassTile extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.all(20),
         decoration: BoxDecoration(
-          color: brandNavy.withOpacity(0.2),
+          color: brandNavy.withValues(alpha: 0.2),
           borderRadius: BorderRadius.circular(28),
           border: Border.all(
-            color: Colors.white.withOpacity(0.25),
+            color: Colors.white.withValues(alpha: 0.25),
             width: 1.0,
           ),
           gradient: LinearGradient(
             begin: Alignment.topLeft,
             end: Alignment.bottomRight,
             colors: [
-              brandNavy.withOpacity(0.25),
-              brandNavy.withOpacity(0.05),
-              accentColor.withOpacity(0.1),
+              brandNavy.withValues(alpha: 0.25),
+              brandNavy.withValues(alpha: 0.05),
+              accentColor.withValues(alpha: 0.1),
             ],
           ),
         ),
@@ -487,9 +554,8 @@ class _LiquidGlassTile extends StatelessWidget {
             Row(
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
-                FaIcon(icon, size: 20, color: brandNavy.withOpacity(0.8)),
-                // Fixed: Removed 'const' to allow dynamic color method invocation
-                Icon(Icons.north_east, size: 14, color: brandNavy.withOpacity(0.4)),
+                FaIcon(icon, size: 20, color: brandNavy.withValues(alpha: 0.8)),
+                Icon(Icons.north_east, size: 14, color: brandNavy.withValues(alpha: 0.4)),
               ],
             ),
             const Spacer(),

@@ -1,8 +1,8 @@
 import 'dart:ui';
 import 'package:flutter/material.dart';
-import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:provider/provider.dart';
 import 'user_provider.dart';
+import 'settings_page.dart';
 
 class YouPage extends StatelessWidget {
   const YouPage({super.key});
@@ -18,7 +18,7 @@ class YouPage extends StatelessWidget {
       extendBody: true,
       body: Stack(
         children: [
-          // Optimized Background: PNG cached via RepaintBoundary
+          // Optimized Background
           Positioned.fill(
             child: RepaintBoundary(
               child: Image.asset(
@@ -73,15 +73,24 @@ class YouPage extends StatelessWidget {
                             ),
                           ),
                         ),
+                        // Fixed Positioned Settings Button
                         Positioned(
                           top: currentTop - 20 + (expandedDropOffset * expandRatio),
                           right: 24,
-                          child: Transform.scale(
-                            scale: 1.0 + (expandRatio * 0.3),
-                            alignment: Alignment.centerRight,
-                            child: IconButton(
-                              onPressed: () {},
-                              icon: const Icon(Icons.settings_outlined, color: brandNavy),
+                          child: Material(
+                            color: Colors.transparent,
+                            child: Transform.scale(
+                              scale: 1.0 + (expandRatio * 0.3),
+                              alignment: Alignment.centerRight,
+                              child: IconButton(
+                                onPressed: () {
+                                  Navigator.push(
+                                    context,
+                                    MaterialPageRoute(builder: (context) => const SettingsPage()),
+                                  );
+                                },
+                                icon: const Icon(Icons.settings_outlined, color: brandNavy),
+                              ),
                             ),
                           ),
                         ),
@@ -91,7 +100,7 @@ class YouPage extends StatelessWidget {
                 ),
               ),
 
-              // Profile Section - Isolated for performance
+              // Profile Section
               SliverToBoxAdapter(
                 child: Padding(
                   padding: const EdgeInsets.fromLTRB(24.0, 16.0, 24.0, 32.0),
@@ -104,11 +113,11 @@ class YouPage extends StatelessWidget {
                           margin: const EdgeInsets.only(top: 50),
                           padding: const EdgeInsets.fromLTRB(24, 60, 24, 24),
                           decoration: BoxDecoration(
-                            color: Colors.white.withOpacity(0.9),
+                            color: Colors.white.withValues(alpha: 0.9),
                             borderRadius: BorderRadius.circular(32),
                             boxShadow: [
                               BoxShadow(
-                                color: Colors.black.withOpacity(0.05),
+                                color: Colors.black.withValues(alpha: 0.05),
                                 blurRadius: 20,
                                 offset: const Offset(0, 10),
                               ),
@@ -132,13 +141,13 @@ class YouPage extends StatelessWidget {
                                   Text(
                                     "${userProvider.playerTitle} Level ${userProvider.level}  |  ${userProvider.currentLevelXp}/${userProvider.nextLevelXp} XP",
                                     style: TextStyle(
-                                      color: brandNavy.withOpacity(0.6),
+                                      color: brandNavy.withValues(alpha: 0.6),
                                       fontSize: 14,
                                       fontWeight: FontWeight.w600,
                                     ),
                                   ),
                                   const SizedBox(width: 4),
-                                  Icon(Icons.info_outline, size: 16, color: brandNavy.withOpacity(0.6)),
+                                  Icon(Icons.info_outline, size: 16, color: brandNavy.withValues(alpha: 0.6)),
                                 ],
                               ),
                               const SizedBox(height: 20),
@@ -147,7 +156,7 @@ class YouPage extends StatelessWidget {
                                 child: LinearProgressIndicator(
                                   value: userProvider.currentLevelXp / userProvider.nextLevelXp,
                                   minHeight: 8,
-                                  backgroundColor: brandNavy.withOpacity(0.1),
+                                  backgroundColor: brandNavy.withValues(alpha: 0.1),
                                   valueColor: const AlwaysStoppedAnimation<Color>(brandGreen),
                                 ),
                               ),
@@ -219,7 +228,7 @@ class YouPage extends StatelessWidget {
                           child: TextButton(
                             onPressed: () {},
                             style: TextButton.styleFrom(
-                              backgroundColor: brandNavy.withOpacity(0.05),
+                              backgroundColor: brandNavy.withValues(alpha: 0.05),
                               shape: RoundedRectangleBorder(
                                 borderRadius: BorderRadius.circular(20),
                               ),
@@ -251,7 +260,7 @@ class YouPage extends StatelessWidget {
                 ),
               ),
 
-              // Account Grid - Optimized by removing repeating blurs
+              // Account Grid
               SliverPadding(
                 padding: const EdgeInsets.symmetric(horizontal: 24.0),
                 sliver: SliverGrid(
@@ -263,9 +272,9 @@ class YouPage extends StatelessWidget {
                   ),
                   delegate: SliverChildListDelegate([
                     _LiquidGlassTile(title: "Achievements", value: "12", icon: Icons.emoji_events_outlined, accentColor: brandGreen),
-                    _LiquidGlassTile(title: "My Posts", value: "24", icon: Icons.grid_view_rounded, accentColor: Color(0xFF90CAF9)),
-                    _LiquidGlassTile(title: "Certificates", value: "3", icon: Icons.verified_user_outlined, accentColor: Color(0xFFFFCC80)),
-                    _LiquidGlassTile(title: "Rewards", value: "2,450", icon: Icons.wallet_giftcard_outlined, accentColor: Color(0xFFCE93D8)),
+                    _LiquidGlassTile(title: "My Posts", value: "24", icon: Icons.grid_view_rounded, accentColor: const Color(0xFF90CAF9)),
+                    _LiquidGlassTile(title: "Certificates", value: "3", icon: Icons.verified_user_outlined, accentColor: const Color(0xFFFFCC80)),
+                    _LiquidGlassTile(title: "Rewards", value: "2,450", icon: Icons.wallet_giftcard_outlined, accentColor: const Color(0xFFCE93D8)),
                   ]),
                 ),
               ),
@@ -287,7 +296,7 @@ class YouPage extends StatelessWidget {
       child: Container(
         padding: const EdgeInsets.symmetric(vertical: 12),
         decoration: BoxDecoration(
-          color: brandNavy.withOpacity(0.05),
+          color: brandNavy.withValues(alpha: 0.05),
           borderRadius: BorderRadius.circular(20),
         ),
         child: Row(
@@ -332,7 +341,7 @@ class _LiquidGlassTile extends StatelessWidget {
           borderRadius: BorderRadius.circular(28),
           boxShadow: [
             BoxShadow(
-              color: brandNavy.withOpacity(0.08),
+              color: brandNavy.withValues(alpha: 0.08),
               blurRadius: 20,
               offset: const Offset(0, 8),
             ),
@@ -343,20 +352,19 @@ class _LiquidGlassTile extends StatelessWidget {
           child: Container(
             padding: const EdgeInsets.all(20),
             decoration: BoxDecoration(
-              // Performance Optimization: Replaced BackdropFilter with high-fidelity smoked gradient.
-              color: brandNavy.withOpacity(0.25),
+              color: brandNavy.withValues(alpha: 0.25),
               borderRadius: BorderRadius.circular(28),
               border: Border.all(
-                color: Colors.white.withOpacity(0.25),
+                color: Colors.white.withValues(alpha: 0.25),
                 width: 1.0,
               ),
               gradient: LinearGradient(
                 begin: Alignment.topLeft,
                 end: Alignment.bottomRight,
                 colors: [
-                  brandNavy.withOpacity(0.35),
-                  brandNavy.withOpacity(0.1),
-                  accentColor.withOpacity(0.15),
+                  brandNavy.withValues(alpha: 0.35),
+                  brandNavy.withValues(alpha: 0.1),
+                  accentColor.withValues(alpha: 0.15),
                 ],
               ),
             ),
@@ -366,8 +374,8 @@ class _LiquidGlassTile extends StatelessWidget {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Icon(icon, size: 20, color: brandNavy.withOpacity(0.8)),
-                    const Icon(Icons.north_east, size: 14, color: Color(0x662D3E50)),
+                    Icon(icon, size: 20, color: brandNavy.withValues(alpha: 0.8)),
+                    Icon(Icons.north_east, size: 14, color: brandNavy.withValues(alpha: 0.4)),
                   ],
                 ),
                 const Spacer(),
@@ -399,18 +407,6 @@ class _LiquidGlassTile extends StatelessWidget {
           ),
         ),
       ),
-    );
-  }
-}
-
-class _BackgroundLayer extends StatelessWidget {
-  const _BackgroundLayer();
-
-  @override
-  Widget build(BuildContext context) {
-    return Image.asset(
-      'assets/images/background.png',
-      fit: BoxFit.cover,
     );
   }
 }

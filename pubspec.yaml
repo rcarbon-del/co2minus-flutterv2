@@ -1,11 +1,11 @@
 name: co2minus
-description: "A new Flutter project."
+description: "Track. Reduce. Neutralize."
 publish_to: 'none'
 
 version: 1.0.0+1
 
 environment:
-  sdk: ^3.11.0
+  sdk: ">=3.0.0 <4.0.0"
 
 dependencies:
   flutter:
@@ -17,18 +17,35 @@ dependencies:
   provider: ^6.1.2
   font_awesome_flutter: ^10.7.0
   google_fonts: ^8.0.2
-  camera: ^0.11.0+2
+  camera: ^0.12.0
+  google_sign_in: ^6.2.1
+  health: ^11.0.0
+  permission_handler: ^11.3.1
+  shared_preferences: ^2.2.3
+  google_mlkit_text_recognition: ^0.14.0
+  tflite_flutter: ^0.11.0
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
   flutter_lints: ^6.0.0
   change_app_package_name: ^1.5.0
+  flutter_launcher_icons: ^0.14.4
+
+flutter_icons:
+  android: "launcher_icon"
+  ios: true
+  image_path: "assets/images/logo.png"
+  min_sdk_android: 21
 
 flutter:
   uses-material-design: true
   assets:
     - assets/images/background.png
+    - assets/images/logo.png
+    - assets/Philippine_LCA_Knowledge_Base.json
+    - assets/models/yolo.tflite
+    - assets/models/lstm.tflite
   fonts:
     - family: MiSans
       fonts:
@@ -44,7 +61,7 @@ flutter:
         - asset: assets/fonts/MiSans/MiSans-Medium.otf
           weight: 500
         - asset: assets/fonts/MiSans/MiSans-Demibold.otf
-          weight: 600 # Or Semibold, you can choose which to map here
+          weight: 600
         - asset: assets/fonts/MiSans/MiSans-Bold.otf
           weight: 700
         - asset: assets/fonts/MiSans/MiSans-Heavy.otf

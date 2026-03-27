@@ -29,11 +29,13 @@ class _CustomNavBarState extends State<CustomNavBar> {
     const double spacerWidth = 65.0;
     const double barHeight = 80.0;
     const double bubbleInset = 8.0;
+    const double scanButtonSize = 72.0;
+    const double scanButtonOverlap = 42.0; // How much it sticks out from the top
 
     return Align(
       alignment: Alignment.bottomCenter,
       child: Padding(
-        padding: const EdgeInsets.all(24.0),
+        padding: const EdgeInsets.fromLTRB(24, 0, 24, 24),
         child: LayoutBuilder(
           builder: (context, constraints) {
             final double fullWidth = constraints.maxWidth;
@@ -83,125 +85,134 @@ class _CustomNavBarState extends State<CustomNavBar> {
 
             double focalX = _isHolding ? _touchX : getIconCenterX(widget.selectedIndex);
 
-            return GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTapDown: (details) {
-                setState(() {
-                  _isHolding = true;
-                  _isPanning = false; // Initial tap: trigger smooth animation
-                  _touchX = details.localPosition.dx.clamp(0.0, fullWidth);
-                });
-              },
-              onTapUp: (details) {
-                widget.onItemTapped(findNearestIndex(details.localPosition.dx));
-                setState(() {
-                  _isHolding = false;
-                  _isPanning = false;
-                });
-              },
-              onTapCancel: () {
-                setState(() {
-                  _isHolding = false;
-                  _isPanning = false;
-                });
-              },
-              onPanStart: (details) {
-                setState(() {
-                  _isHolding = true;
-                  _isPanning = true; // Start panning: switch to fast/instant duration
-                });
-              },
-              onPanUpdate: (details) {
-                setState(() {
-                  _touchX = details.localPosition.dx.clamp(0.0, fullWidth);
-                });
-              },
-              onPanEnd: (details) {
-                widget.onItemTapped(findNearestIndex(_touchX));
-                setState(() {
-                  _isHolding = false;
-                  _isPanning = false;
-                });
-              },
-              onPanCancel: () => setState(() {
-                _isHolding = false;
-                _isPanning = false;
-              }),
+            return SizedBox(
+              height: barHeight + scanButtonOverlap,
               child: Stack(
-                alignment: Alignment.center,
                 clipBehavior: Clip.none,
+                alignment: Alignment.bottomCenter,
                 children: [
-                  // Navbar Container with elevation shadow
-                  Container(
-                    decoration: BoxDecoration(
-                      borderRadius: BorderRadius.circular(40),
-                      boxShadow: [
-                        BoxShadow(
-                          color: Colors.black.withValues(alpha: 0.1),
-                          blurRadius: 25,
-                          offset: const Offset(0, 10),
-                        ),
-                      ],
-                    ),
-                    child: ClipRRect(
-                      borderRadius: BorderRadius.circular(40),
-                      child: ClipPath(
-                        clipper: NotchClipper(),
-                        child: BackdropFilter(
-                          filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
-                          child: CustomPaint(
-                            painter: NavbarBackgroundPainter(
-                              color: const Color(0xFFC8FFB0).withValues(alpha: 0.75),
-                              borderColor: Colors.white.withValues(alpha: 0.4),
-                              clipper: NotchClipper(),
+                  // This GestureDetector handles the navbar items
+                  Positioned(
+                    bottom: 0,
+                    left: 0,
+                    right: 0,
+                    height: barHeight,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onTapDown: (details) {
+                        setState(() {
+                          _isHolding = true;
+                          _isPanning = false;
+                          _touchX = details.localPosition.dx.clamp(0.0, fullWidth);
+                        });
+                      },
+                      onTapUp: (details) {
+                        widget.onItemTapped(findNearestIndex(details.localPosition.dx));
+                        setState(() {
+                          _isHolding = false;
+                          _isPanning = false;
+                        });
+                      },
+                      onTapCancel: () {
+                        setState(() {
+                          _isHolding = false;
+                          _isPanning = false;
+                        });
+                      },
+                      onPanStart: (details) {
+                        setState(() {
+                          _isHolding = true;
+                          _isPanning = true;
+                        });
+                      },
+                      onPanUpdate: (details) {
+                        setState(() {
+                          _touchX = details.localPosition.dx.clamp(0.0, fullWidth);
+                        });
+                      },
+                      onPanEnd: (details) {
+                        widget.onItemTapped(findNearestIndex(_touchX));
+                        setState(() {
+                          _isHolding = false;
+                          _isPanning = false;
+                        });
+                      },
+                      onPanCancel: () => setState(() {
+                        _isHolding = false;
+                        _isPanning = false;
+                      }),
+                      child: Container(
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(40),
+                          boxShadow: [
+                            BoxShadow(
+                              color: Colors.black.withValues(alpha: 0.1),
+                              blurRadius: 25,
+                              offset: const Offset(0, 10),
                             ),
-                            child: SizedBox(
-                              width: fullWidth,
-                              height: barHeight,
-                              child: Stack(
-                                children: [
-                                  AnimatedPositioned(
-                                    duration: _isPanning
-                                        ? const Duration(milliseconds: 60)
-                                        : const Duration(milliseconds: 400),
-                                    curve: Curves.fastOutSlowIn,
-                                    left: currentBubbleLeft + bubbleInset,
-                                    top: bubbleInset - 1,
-                                    bottom: bubbleInset + 1,
-                                    width: baseBubbleWidth - (bubbleInset * 2),
-                                    child: Container(
-                                      decoration: BoxDecoration(
-                                        borderRadius: BorderRadius.circular(32),
-                                        gradient: LinearGradient(
-                                          begin: Alignment.topLeft,
-                                          end: Alignment.bottomRight,
-                                          colors: [
-                                            brandNavy.withValues(alpha: 0.32),
-                                            brandNavy.withValues(alpha: 0.18),
-                                            brandNavy.withValues(alpha: 0.1),
-                                          ],
-                                          stops: const [0.0, 0.5, 1.0],
-                                        ),
-                                        border: Border.all(
-                                          color: Colors.white.withValues(alpha: 0.12),
-                                          width: 1.0,
+                          ],
+                        ),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(40),
+                          child: ClipPath(
+                            clipper: NotchClipper(),
+                            child: BackdropFilter(
+                              filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+                              child: CustomPaint(
+                                painter: NavbarBackgroundPainter(
+                                  color: const Color(0xFFC8FFB0).withValues(alpha: 0.75),
+                                  borderColor: Colors.white.withValues(alpha: 0.4),
+                                  clipper: NotchClipper(),
+                                ),
+                                child: SizedBox(
+                                  width: fullWidth,
+                                  height: barHeight,
+                                  child: Stack(
+                                    children: [
+                                      AnimatedPositioned(
+                                        duration: _isPanning
+                                            ? const Duration(milliseconds: 60)
+                                            : const Duration(milliseconds: 400),
+                                        curve: Curves.fastOutSlowIn,
+                                        left: currentBubbleLeft + bubbleInset,
+                                        top: bubbleInset - 1,
+                                        bottom: bubbleInset + 1,
+                                        width: baseBubbleWidth - (bubbleInset * 2),
+                                        child: Container(
+                                          decoration: BoxDecoration(
+                                            borderRadius: BorderRadius.circular(32),
+                                            gradient: LinearGradient(
+                                              begin: Alignment.topLeft,
+                                              end: Alignment.bottomRight,
+                                              colors: [
+                                                brandNavy.withValues(alpha: 0.32),
+                                                brandNavy.withValues(alpha: 0.18),
+                                                brandNavy.withValues(alpha: 0.1),
+                                              ],
+                                              stops: const [0.0, 0.5, 1.0],
+                                            ),
+                                            border: Border.all(
+                                              color: Colors.white.withValues(alpha: 0.12),
+                                              width: 1.0,
+                                            ),
+                                          ),
                                         ),
                                       ),
-                                    ),
+                                      Padding(
+                                        padding: const EdgeInsets.symmetric(horizontal: horizontalPadding),
+                                        child: Row(
+                                          children: [
+                                            _buildNavIcon(FontAwesomeIcons.house, 0, focalX, itemWidth),
+                                            _buildNavIcon(FontAwesomeIcons.bookBookmark, 1, focalX, itemWidth),
+                                            const SizedBox(width: spacerWidth),
+                                            _buildNavIcon(FontAwesomeIcons.calculator, 2, focalX, itemWidth),
+                                            _buildNavIcon(FontAwesomeIcons.solidUser, 3, focalX, itemWidth),
+                                          ],
+                                        ),
+                                      ),
+                                    ],
                                   ),
-                                  Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: horizontalPadding),
-                                    child: Row(
-                                      children: [
-                                        _buildNavIcon(FontAwesomeIcons.house, 0, focalX, itemWidth),
-                                        _buildNavIcon(FontAwesomeIcons.bookBookmark, 1, focalX, itemWidth),
-                                        const SizedBox(width: spacerWidth),
-                                        _buildNavIcon(FontAwesomeIcons.calculator, 2, focalX, itemWidth),
-                                        _buildNavIcon(FontAwesomeIcons.solidUser, 3, focalX, itemWidth),
-                                      ],
-                                    ),
-                                  ),
-                                ],
+                                ),
                               ),
                             ),
                           ),
@@ -209,8 +220,9 @@ class _CustomNavBarState extends State<CustomNavBar> {
                       ),
                     ),
                   ),
+                  // The Scan Button is now its own top-level child of the Stack
                   Positioned(
-                    top: -42,
+                    top: 0,
                     child: GestureDetector(
                       onTap: () {
                         Navigator.push(
@@ -218,6 +230,7 @@ class _CustomNavBarState extends State<CustomNavBar> {
                           MaterialPageRoute(builder: (context) => const ScannerPage()),
                         );
                       },
+                      behavior: HitTestBehavior.opaque,
                       child: _buildScanButton(),
                     ),
                   ),

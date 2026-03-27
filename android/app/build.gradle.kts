@@ -7,7 +7,7 @@ plugins {
 
 android {
     namespace = "com.abvlnt.co2minus"
-    compileSdk = flutter.compileSdkVersion
+    compileSdk = 36 // Updated to latest
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
@@ -21,15 +21,21 @@ android {
 
     defaultConfig {
         applicationId = "com.abvlnt.co2minus"
-        minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+        minSdk = 26 // Required by the 'health' plugin
+        targetSdk = 36 // Updated to latest
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
 
     buildTypes {
-        release {
+        getByName("release") {
             signingConfig = signingConfigs.getByName("debug")
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 }
