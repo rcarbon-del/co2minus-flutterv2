@@ -21,7 +21,7 @@ android {
 
     defaultConfig {
         applicationId = "com.abvlnt.co2minus"
-        minSdk = 26 // Required by the 'health' plugin
+        minSdk = 29
         targetSdk = 36 // Updated to latest
         versionCode = flutter.versionCode
         versionName = flutter.versionName
@@ -47,5 +47,4 @@ flutter {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("com.gorisse.thomas.sceneform:ux:1.23.0")
 }
