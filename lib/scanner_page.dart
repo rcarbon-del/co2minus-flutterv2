@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -10,15 +11,18 @@ import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
+import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 
-import 'package:ar_flutter_plugin_2/ar_flutter_plugin.dart';
-import 'package:ar_flutter_plugin_2/datatypes/config_planedetection.dart';
-import 'package:ar_flutter_plugin_2/managers/ar_anchor_manager.dart';
-import 'package:ar_flutter_plugin_2/managers/ar_location_manager.dart';
-import 'package:ar_flutter_plugin_2/managers/ar_object_manager.dart';
-import 'package:ar_flutter_plugin_2/managers/ar_session_manager.dart';
-import 'package:ar_flutter_plugin_2/models/ar_hittest_result.dart';
+// NEW: For Image Uploads
+import 'package:image_picker/image_picker.dart';
+
+// Official OpenFoodFacts Package
+import 'package:openfoodfacts/openfoodfacts.dart';
+
+// Official Ultralytics YOLO Package
+import 'package:ultralytics_yolo/ultralytics_yolo.dart';
+import 'package:ultralytics_yolo/yolo.dart';
 
 import 'user_provider.dart';
 
@@ -38,6 +42,8 @@ class ScannerPage extends StatefulWidget {
 }
 
 class _ScannerPageState extends State<ScannerPage> {
+  static const platform = MethodChannel('co2minus.app/ar_depth');
+
   CameraController? _controller;
   bool _isFlashOn = false;
   bool _isInitialized = false;
@@ -45,27 +51,20 @@ class _ScannerPageState extends State<ScannerPage> {
   // Services & ML Components
   final TextRecognizer _textRecognizer = TextRecognizer();
 
+  // Upload & Cancel States
+  final ImagePicker _picker = ImagePicker();
+  bool _isCancelled = false;
+
   // Integrated Carbon Estimator Components
-  Interpreter? _yoloInterpreter;
   Interpreter? _gruInterpreter;
   Map<String, dynamic>? _lcaDatabase;
   Map<String, dynamic>? _scalerConfig;
 
+  // Ultralytics YOLO Instance
+  YOLO? _yoloPlugin;
+
   // Diagnostic String for the new Dialog
   String _diagnosticMessage = "Initializing systems...";
-
-  // AR State
-  ARSessionManager? _arSessionManager;
-  ARObjectManager? _arObjectManager;
-  bool _isArMode = false;
-  Completer<double>? _arDepthCompleter;
-
-  // YOLO Classes from data.yaml
-  final List<String> _yoloLabels = [
-    'can_drink', 'can_food', 'cleaning_product', 'cooking_oil_bottle',
-    'instant_drink_sachet', 'instant_noodles', 'personal_care',
-    'plastic-bottle', 'rice_pack', 'snack_pack'
-  ];
 
   // Inference State
   bool _isDialogShowing = false;
@@ -81,7 +80,6 @@ class _ScannerPageState extends State<ScannerPage> {
   @override
   void initState() {
     super.initState();
-    // Initialize everything, THEN check for the instruction & diagnostic dialogs
     _initializeSystem().then((_) {
       if (mounted) {
         _checkShowInstructions();
@@ -121,12 +119,21 @@ class _ScannerPageState extends State<ScannerPage> {
         diag += "❌ JSON Databases Error: $e\n";
       }
 
-      // 3. Load YOLO Model
+      // 3. Load YOLO26 Model (Ultralytics Package)
       try {
-        _yoloInterpreter = await Interpreter.fromAsset('assets/models/yolo.tflite');
-        diag += "✅ YOLOv8 Vision Model\n";
+        // Extract model to physical storage so C++ backend can read it
+        final byteData = await rootBundle.load('assets/models/yolo.tflite');
+        final file = File('${Directory.systemTemp.path}/yolo.tflite');
+        await file.writeAsBytes(byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes));
+
+        _yoloPlugin = YOLO(
+          modelPath: file.path,
+          task: YOLOTask.detect,
+        );
+        await _yoloPlugin!.loadModel();
+        diag += "✅ YOLO26 Vision Model\n";
       } catch (e) {
-        diag += "❌ YOLO Model Error: $e\n";
+        diag += "❌ YOLO26 Model Error: $e\n";
       }
 
       // 4. Load GRU Model
@@ -134,8 +141,11 @@ class _ScannerPageState extends State<ScannerPage> {
         _gruInterpreter = await Interpreter.fromAsset('assets/models/gru.tflite');
         diag += "✅ GRU Estimation Model\n";
       } catch (e) {
-        diag += "❌ GRU Model Error (Precondition/Memory): $e\n";
+        diag += "❌ GRU Model Error: $e\n";
       }
+
+      // Initialize OpenFoodFacts UserAgent
+      OpenFoodAPIConfiguration.userAgent = UserAgent(name: 'CO2Minus_App');
 
     } catch (e) {
       diag += "\nCritical System Error: $e";
@@ -181,7 +191,6 @@ class _ScannerPageState extends State<ScannerPage> {
       );
     }
 
-    // Show the diagnostic checklist after the instructions
     if (mounted) {
       _showDiagnosticDialog();
     }
@@ -246,82 +255,63 @@ class _ScannerPageState extends State<ScannerPage> {
     }
   }
 
-  // --- AR FLUTTER PLUGIN 2 HANDLERS ---
-  void onARViewCreated(
-      ARSessionManager arSessionManager,
-      ARObjectManager arObjectManager,
-      ARAnchorManager arAnchorManager,
-      ARLocationManager arLocationManager) {
-    _arSessionManager = arSessionManager;
-    _arObjectManager = arObjectManager;
-
-    _arSessionManager!.onInitialize(
-      showFeaturePoints: false,
-      showPlanes: true,
-      showWorldOrigin: false,
-      handlePans: false,
-      handleRotation: false,
-    );
-    _arObjectManager!.onInitialize();
-
-    _arSessionManager!.onPlaneOrPointTap = onPlaneOrPointTapped;
-  }
-
-  void onPlaneOrPointTapped(List<ARHitTestResult> hitTestResults) {
-    if (hitTestResults.isNotEmpty && _arDepthCompleter != null && !_arDepthCompleter!.isCompleted) {
-      double distanceInMeters = hitTestResults.first.distance;
-      double distanceInCm = distanceInMeters * 100.0;
-
-      _arDepthCompleter!.complete(distanceInCm);
-      if (mounted) {
-        ScaffoldMessenger.of(context).hideCurrentSnackBar();
-      }
+  void _cancelPipeline() {
+    _isCancelled = true;
+    if (_isDialogShowing) {
+      Navigator.pop(context);
+      _isDialogShowing = false;
     }
+    setState(() {
+      _isAnalyzing = false;
+    });
   }
 
-  // --- YOLO TENSOR PROCESSING ---
+  // --- YOLO26 ULTRALYTICS INFERENCE ---
   Future<String?> _runYoloInference(String imagePath) async {
-    if (_yoloInterpreter == null) return null;
+    if (_yoloPlugin == null) return null;
 
     try {
       final bytes = await File(imagePath).readAsBytes();
+
       img.Image? decodedImage = img.decodeImage(bytes);
-      if (decodedImage == null) return null;
+      if (decodedImage != null) {
+        decodedImage = img.bakeOrientation(decodedImage);
+        final Uint8List fixedBytes = img.encodeJpg(decodedImage);
 
-      img.Image resizedImage = img.copyResize(decodedImage, width: 640, height: 640);
+        final resultsMap = await _yoloPlugin!.predict(
+          fixedBytes,
+          confidenceThreshold: 0.15,
+        );
 
-      var input = List.generate(1, (i) => List.generate(640, (j) => List.generate(640, (k) => List.generate(3, (l) => 0.0))));
-      for (int y = 0; y < 640; y++) {
-        for (int x = 0; x < 640; x++) {
-          final pixel = resizedImage.getPixel(x, y);
-          input[0][y][x][0] = pixel.r / 255.0; // R
-          input[0][y][x][1] = pixel.g / 255.0; // G
-          input[0][y][x][2] = pixel.b / 255.0; // B
-        }
-      }
+        if (resultsMap.isNotEmpty) {
+          double bestConf = 0.0;
+          String bestLabel = "";
 
-      var output = List.generate(1, (i) => List.generate(14, (j) => List.filled(8400, 0.0)));
-      _yoloInterpreter!.run(input, output);
+          resultsMap.forEach((key, value) {
+            if (value is List) {
+              for (var item in value) {
+                if (item is Map) {
+                  double conf = (item['confidence'] ?? item['score'] ?? 0.0).toDouble();
+                  String label = (item['className'] ?? item['label'] ?? item['class'] ?? "").toString();
 
-      double maxConfidence = 0.0;
-      int bestClassIndex = -1;
+                  if (conf > bestConf && label.isNotEmpty) {
+                    bestConf = conf;
+                    bestLabel = label;
+                  }
+                }
+              }
+            }
+          });
 
-      for (int p = 0; p < 8400; p++) {
-        for (int c = 0; c < 10; c++) {
-          double confidence = output[0][c + 4][p];
-          if (confidence > maxConfidence) {
-            maxConfidence = confidence;
-            bestClassIndex = c;
+          if (bestLabel.isNotEmpty) {
+            debugPrint("🎯 Best Native Match: $bestLabel | ${(bestConf * 100).toStringAsFixed(1)}%");
+            return bestLabel;
           }
         }
       }
-
-      if (maxConfidence > 0.45 && bestClassIndex != -1) {
-        return _yoloLabels[bestClassIndex];
-      }
       return null;
     } catch (e) {
-      debugPrint("YOLO Inference Error: $e");
+      debugPrint("YOLO26 Inference Error: $e");
       return null;
     }
   }
@@ -362,7 +352,6 @@ class _ScannerPageState extends State<ScannerPage> {
       double finalCarbonFootprint = outputTensor[0][0];
 
       if (finalCarbonFootprint.isNaN) {
-        debugPrint("GRU Output was NaN!");
         return null;
       }
 
@@ -374,57 +363,49 @@ class _ScannerPageState extends State<ScannerPage> {
     }
   }
 
-  // --- AR VOLUMETRIC FAILSAFE ---
+  // --- AUTOMATED TRUE DEPTH SCALING ---
   Future<double> _estimateWeightViaAR(String detectedClass) async {
-    double depthToItemCm = 30.0; // Default fallback baseline distance
+    double depthToItemCm = 30.0;
 
-    _emitUpdate(70, "3. Volumetric Failsafe (AR)", "Missing weight. Handing off to AR Lens...");
+    _emitUpdate(65, "3. True Depth (AR)", "⚠️ PLEASE HOLD DEVICE PERFECTLY STILL ⚠️");
+    await Future.delayed(const Duration(milliseconds: 1500));
+    if (_isCancelled) throw Exception("cancelled_by_user");
+
+    _emitUpdate(70, "3. True Depth (AR)", "Activating Auto-Laser...");
+    await Future.delayed(const Duration(milliseconds: 400));
 
     await _controller?.dispose();
     _controller = null;
 
-    if (!mounted) return depthToItemCm;
-
-    if (_isDialogShowing) {
+    if (mounted && _isDialogShowing) {
       Navigator.pop(context);
       _isDialogShowing = false;
     }
 
-    setState(() { _isArMode = true; });
-    ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text("AR Mode Active: Tap the item on the screen to measure its depth!"),
-          backgroundColor: Color(0xFF2D3E50),
-          duration: Duration(seconds: 15),
-        )
-    );
-
-    _arDepthCompleter = Completer<double>();
     try {
-      depthToItemCm = await _arDepthCompleter!.future.timeout(const Duration(seconds: 15));
-      _emitUpdate(75, "3. Volumetric Failsafe (AR)", "Target locked via AR Tap at ${depthToItemCm.toStringAsFixed(1)} cm");
+      final double? result = await platform.invokeMethod('measureDepth');
+
+      if (result != null && result > 0) {
+        depthToItemCm = result;
+        _emitUpdate(75, "3. True Depth (AR)", "Auto-laser hit! Depth locked at ${depthToItemCm.toStringAsFixed(1)} cm");
+      } else {
+        _emitUpdate(75, "3. True Depth (AR)", "Laser failed. Using 30cm baseline.");
+      }
+    } on PlatformException catch (e) {
+      debugPrint("Native AR Error: ${e.message}");
+      _emitUpdate(75, "3. True Depth (AR)", "Native sensor error. Using 30cm baseline.");
     } catch (e) {
-      debugPrint("AR Tap Timeout/Error: $e");
-      _emitUpdate(75, "3. Volumetric Failsafe (AR)", "AR tap timed out. Using 30cm baseline.");
-      depthToItemCm = 30.0;
+      debugPrint("Native AR Missing Plugin Error: $e");
+      _emitUpdate(75, "3. True Depth (AR)", "AR Module bypassed. Using 30cm baseline.");
     }
 
-    _arSessionManager?.dispose();
-    _arSessionManager = null;
-    _arObjectManager = null;
+    if (mounted) {
+      setState(() => _isInitialized = false);
+      await _initializeCamera();
+    }
 
-    if (!mounted) return depthToItemCm;
-
-    setState(() {
-      _isArMode = false;
-      _isInitialized = false;
-    });
-
-    await _initializeCamera();
-
-    if (!mounted) return depthToItemCm;
-
-    if (!_isDialogShowing) {
+    // After AR returns, show the dialog again if the user didn't abort it before AR launched
+    if (mounted && !_isDialogShowing && !_isCancelled) {
       _isDialogShowing = true;
       showDialog(
         context: context,
@@ -433,11 +414,12 @@ class _ScannerPageState extends State<ScannerPage> {
           updateStream: _pipelineController!.stream,
           initialLogs: _pipelineHistory,
           initialProgress: _currentPipelineProgress,
+          onCancel: _cancelPipeline,
         ),
       );
     }
 
-    // Exact Volumetric Logic
+    // Exact Volumetric Scaling
     double widthCm = 0.0; double heightCm = 0.0; double depthCm = 0.0;
     double densityGCm3 = 1.0;
 
@@ -464,9 +446,8 @@ class _ScannerPageState extends State<ScannerPage> {
     return weightGrams / 1000.0;
   }
 
-  // --- DEBUG HELPER METHOD ---
   Future<void> _debugPause(String stepName, String details) async {
-    if (!mounted) return;
+    if (!mounted || _isCancelled) return;
     return showDialog<void>(
       context: context,
       barrierDismissible: false,
@@ -516,12 +497,14 @@ class _ScannerPageState extends State<ScannerPage> {
     );
   }
 
-  Future<void> _runPipeline() async {
-    if (_isDialogShowing || _isAnalyzing || !_isInitialized) return;
+  Future<void> _runPipeline({XFile? preSelectedImage}) async {
+    if (_isDialogShowing || _isAnalyzing) return;
+    if (preSelectedImage == null && !_isInitialized) return;
 
     setState(() {
       _isAnalyzing = true;
       _isDialogShowing = true;
+      _isCancelled = false; // Reset on start
     });
 
     _pipelineHistory.clear();
@@ -535,6 +518,7 @@ class _ScannerPageState extends State<ScannerPage> {
         updateStream: _pipelineController!.stream,
         initialLogs: _pipelineHistory,
         initialProgress: _currentPipelineProgress,
+        onCancel: _cancelPipeline,
       ),
     );
 
@@ -543,47 +527,86 @@ class _ScannerPageState extends State<ScannerPage> {
       String currentDetectedClass = "";
       bool isObjectDetected = false;
 
-      // STEP 1: Multiple YOLO Passes
-      _emitUpdate(5, "1. Trigger & Identification (YOLO)", "Initiating 5-frame rapid capture...");
-
-      List<XFile> capturedFrames = [];
-      for (int i = 0; i < 5; i++) {
-        capturedFrames.add(await _controller!.takePicture());
-        await Future.delayed(const Duration(milliseconds: 150));
-      }
-
-      await _debugPause("Capture Initiation", "Successfully captured 5 frames in sequence for analysis.");
-
-      for (int i = 0; i < 5; i++) {
-        _emitUpdate(10 + (i * 6), "1. Trigger & Identification (YOLO)", "Pass ${i + 1}: Analyzing frame...");
-        finalImage = capturedFrames[i];
+      // STEP 1: Image Sourcing & YOLO Passes
+      if (preSelectedImage != null) {
+        _emitUpdate(5, "1. Image Upload", "Analyzing uploaded image...");
+        finalImage = preSelectedImage;
+        await Future.delayed(const Duration(milliseconds: 500));
+        if (_isCancelled) throw Exception("cancelled_by_user");
 
         String? yoloResult = await _runYoloInference(finalImage.path);
-
         if (yoloResult != null) {
           isObjectDetected = true;
           currentDetectedClass = yoloResult;
-        } else if (i == 4 && !isObjectDetected) {
-          isObjectDetected = true;
-          currentDetectedClass = "plastic-bottle";
+        }
+      } else {
+        _emitUpdate(5, "1. Trigger & Identification", "Initiating 5-frame rapid capture...");
+
+        List<XFile> capturedFrames = [];
+        for (int i = 0; i < 5; i++) {
+          if (_isCancelled) throw Exception("cancelled_by_user");
+          capturedFrames.add(await _controller!.takePicture());
+          await Future.delayed(const Duration(milliseconds: 150));
+        }
+
+        await _debugPause("Capture Initiation", "Successfully captured 5 frames in sequence for analysis.");
+        if (_isCancelled) throw Exception("cancelled_by_user");
+
+        for (int i = 0; i < 5; i++) {
+          if (_isCancelled) throw Exception("cancelled_by_user");
+          _emitUpdate(10 + (i * 6), "1. Vision Model (YOLO26)", "Pass ${i + 1}: Analyzing frame natively...");
+          finalImage = capturedFrames[i];
+
+          String? yoloResult = await _runYoloInference(finalImage.path);
+
+          if (yoloResult != null) {
+            isObjectDetected = true;
+            currentDetectedClass = yoloResult;
+            break;
+          }
         }
       }
 
+      if (_isCancelled) throw Exception("cancelled_by_user");
+
       if (!isObjectDetected || currentDetectedClass.isEmpty) {
-        _emitUpdate(40, "1. Trigger & Identification (YOLO)", "Detection failed. No object found.");
+        _emitUpdate(40, "1. Vision Model (YOLO26)", "Detection failed. No object found.");
         throw Exception("YOLO Object Detection Failed.");
       }
 
-      _emitUpdate(40, "1. Trigger & Identification (YOLO)", "Classification Confirmed: $currentDetectedClass");
+      _emitUpdate(40, "1. Vision Model (YOLO26)", "Classification Confirmed: $currentDetectedClass");
       if (finalImage == null) throw Exception("Failed to capture image");
 
-      await _debugPause("Step 1 Complete", "Final YOLO Classification Selected: $currentDetectedClass");
+      await _debugPause("Step 1 Complete", "Final YOLO26 Classification Selected: $currentDetectedClass");
+      if (_isCancelled) throw Exception("cancelled_by_user");
 
       // STEP 2: OCR Data Extraction
       _emitUpdate(50, "2. Data Extraction (OCR)", "Scanning packaging for weight & labels...");
       final InputImage inputImage = InputImage.fromFilePath(finalImage.path);
       final RecognizedText recognizedText = await _textRecognizer.processImage(inputImage);
       String ocrText = recognizedText.text.replaceAll('\n', ' ').toLowerCase();
+
+      // =========================================================================
+      // SPATIAL OCR SORTING
+      // =========================================================================
+      List<TextBlock> sortedBlocks = recognizedText.blocks.toList();
+      sortedBlocks.sort((a, b) {
+        double areaA = a.boundingBox.width * a.boundingBox.height;
+        double areaB = b.boundingBox.width * b.boundingBox.height;
+        return areaB.compareTo(areaA);
+      });
+
+      List<String> prominentText = [];
+      for (var block in sortedBlocks.take(3)) {
+        String text = block.text.replaceAll('\n', ' ').trim();
+        if (text.length > 2 && !text.toLowerCase().contains("net") && !text.toLowerCase().contains("weight")) {
+          prominentText.add(text);
+        }
+      }
+      String ocrSearchContext = prominentText.join(' ');
+      // =========================================================================
+
+      if (_isCancelled) throw Exception("cancelled_by_user");
 
       double detectedWeightKg = 0.5;
       bool ocrWeightFound = false;
@@ -615,35 +638,83 @@ class _ScannerPageState extends State<ScannerPage> {
         }
       }
 
-      List<String> targetLabels = ['organic', 'recyclable', 'recycled', 'biodegradable', 'vegan', 'fair trade', 'sugar free', 'halal', 'fda approved'];
-      List<String> foundLabels = [];
-      for (String label in targetLabels) {
-        if (ocrText.contains(label)) {
-          foundLabels.add(label.toUpperCase());
+      // STEP 2.5: OPEN FOOD FACTS CLOUD API FALLBACK
+      if (!ocrWeightFound) {
+        _emitUpdate(58, "2. Cloud API Fallback", "Local OCR failed. Querying OpenFacts DB...");
+
+        String searchQuery = ocrSearchContext.isNotEmpty
+            ? "$ocrSearchContext ${currentDetectedClass.replaceAll('_', ' ')}"
+            : (detectedBrand != "Unknown" ? "$detectedBrand ${currentDetectedClass.replaceAll('_', ' ')}" : currentDetectedClass.replaceAll('_', ' '));
+
+        try {
+          ProductSearchQueryConfiguration configuration = ProductSearchQueryConfiguration(
+            parametersList: <Parameter>[
+              SearchTerms(terms: [searchQuery]),
+            ],
+            language: OpenFoodFactsLanguage.ENGLISH,
+            fields: [ProductField.QUANTITY, ProductField.BRANDS],
+            version: ProductQueryVersion.v3,
+          );
+
+          SearchResult result = await OpenFoodAPIClient.searchProducts(
+            null,
+            configuration,
+          );
+
+          if (result.products != null && result.products!.isNotEmpty) {
+            for (var product in result.products!) {
+              if (product.quantity != null && product.quantity!.isNotEmpty) {
+                RegExp regex = RegExp(r'(\d+(?:\.\d+)?)\s*(kg|g|ml|l|cl)', caseSensitive: false);
+                var m = regex.firstMatch(product.quantity!);
+
+                if (m != null) {
+                  double val = double.parse(m.group(1)!);
+                  String unit = m.group(2)!.toLowerCase();
+
+                  if (unit == 'g' || unit == 'ml' || unit == 'cl') {
+                    if (unit == 'cl') val *= 10;
+                    detectedWeightKg = val / 1000.0;
+                  } else {
+                    detectedWeightKg = val;
+                  }
+
+                  ocrWeightFound = true;
+                  detectedBrand = (product.brands ?? detectedBrand).toUpperCase();
+                  _emitUpdate(62, "2. Cloud API (Success)", "Matched $detectedBrand: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
+                  break;
+                }
+              }
+            }
+          }
+        } catch (e) {
+          debugPrint("OpenFoodFacts DB Fetch Error: $e");
+          _emitUpdate(62, "2. Cloud API", "Cloud fetch failed. Proceeding to AR.");
         }
       }
-      String labelsDisplay = foundLabels.isNotEmpty ? foundLabels.join(', ') : "None";
+
+      if (_isCancelled) throw Exception("cancelled_by_user");
 
       String weightDisplay = ocrWeightFound ? "${(detectedWeightKg * 1000).toStringAsFixed(0)}g" : "Not Found";
-      String extText = "W: $weightDisplay | B: $detectedBrand \nLabels: $labelsDisplay";
+      String extText = "W: $weightDisplay | B: $detectedBrand";
 
-      _emitUpdate(60, "2. Data Extraction (OCR)", extText);
-      await _debugPause("Step 2 Complete", "OCR Data Extracted:\n$extText");
+      _emitUpdate(65, "2. Data Extraction", extText);
+      await _debugPause("Step 2 Complete", "Data Extracted:\n$extText");
+      if (_isCancelled) throw Exception("cancelled_by_user");
 
-      // STEP 3: AR Volumetric Failsafe
+      // STEP 3: Automated True Depth Failsafe
       if (!ocrWeightFound) {
         detectedWeightKg = await _estimateWeightViaAR(currentDetectedClass);
-        _emitUpdate(80, "3. Volumetric Failsafe (AR)", "Mapped physical volume. Estimated mass: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
+        _emitUpdate(80, "3. True Depth (AR)", "Estimated mass scaled by distance: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
       } else {
-        _emitUpdate(70, "3. Volumetric Failsafe (AR)", "Checking depth sensors...");
+        _emitUpdate(70, "3. True Depth (AR)", "Bypassing AR Laser: Exact weight found.");
         await Future.delayed(const Duration(milliseconds: 600));
-        _emitUpdate(80, "3. Volumetric Failsafe (AR)", "OCR parameters sufficient. AR bypassed.");
       }
 
-      await _debugPause("Step 3 Complete", "Volumetric calculation complete.\nEstimated Mass: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
+      if (_isCancelled) throw Exception("cancelled_by_user");
+      await _debugPause("Step 3 Complete", "Volumetric calculation complete.\nFinal Assigned Mass: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
 
       // STEP 4: AI Cross-Validation
-      _emitUpdate(85, "4. Multi-Modal Cross-Validation", "Matching YOLO vision with OCR context...");
+      _emitUpdate(85, "4. Multi-Modal Validation", "Matching YOLO vision with text context...");
       await Future.delayed(const Duration(milliseconds: 800));
 
       bool isContradiction = false;
@@ -660,13 +731,16 @@ class _ScannerPageState extends State<ScannerPage> {
       }
 
       if (isContradiction) {
-        _emitUpdate(90, "4. Multi-Modal Cross-Validation", "Contradiction found! $mismatchReason");
+        _emitUpdate(90, "4. Multi-Modal Validation", "Contradiction found! $mismatchReason");
         await Future.delayed(const Duration(milliseconds: 2000));
         throw Exception("Cross-validation failed. $mismatchReason Please re-scan.");
       }
 
-      _emitUpdate(90, "4. Multi-Modal Cross-Validation", "Data verified. No contradictions found.");
-      await _debugPause("Step 4 Complete", "Multi-Modal Validation passed successfully with no contradictions.");
+      _emitUpdate(90, "4. Multi-Modal Validation", "Data verified. No contradictions found.");
+      if (_isCancelled) throw Exception("cancelled_by_user");
+
+      await _debugPause("Step 4 Complete", "Multi-Modal Validation passed successfully.");
+      if (_isCancelled) throw Exception("cancelled_by_user");
 
       // STEP 5: GRU Carbon Estimation
       _emitUpdate(95, "5. GRU Carbon Estimation", "Feeding validated sequence to RNN...");
@@ -680,7 +754,7 @@ class _ScannerPageState extends State<ScannerPage> {
       _emitUpdate(100, "Sequence Complete", "Estimated Footprint: ${finalFootprint.toStringAsFixed(2)} kg CO2e");
       await _debugPause("Step 5 Complete", "GRU Network output: ${finalFootprint.toStringAsFixed(2)} kg CO2e");
 
-      if (!mounted) return;
+      if (!mounted || _isCancelled) return;
       if (_isDialogShowing) {
         Navigator.pop(context);
       }
@@ -691,6 +765,11 @@ class _ScannerPageState extends State<ScannerPage> {
       _showSuccessPopup(finalImage.path);
 
     } catch (e) {
+      if (e.toString().contains("cancelled_by_user")) {
+        debugPrint("Pipeline gracefully aborted by user.");
+        return; // Exit silently
+      }
+
       debugPrint("Pipeline Error: $e");
       if (!mounted) return;
       if (_isDialogShowing) {
@@ -760,9 +839,7 @@ class _ScannerPageState extends State<ScannerPage> {
   void dispose() {
     _pipelineController?.close();
     _controller?.dispose();
-    _arSessionManager?.dispose();
     _textRecognizer.close();
-    _yoloInterpreter?.close();
     _gruInterpreter?.close();
     super.dispose();
   }
@@ -792,19 +869,13 @@ class _ScannerPageState extends State<ScannerPage> {
   Widget build(BuildContext context) {
     const Color brandNavy = Color(0xFF2D3E50);
     const Color brandGreen = Color(0xFFC8FFB0);
-    final userProvider = Provider.of<UserProvider>(context, listen: false);
 
     return Scaffold(
       backgroundColor: Colors.black,
       body: Stack(
         children: [
           Positioned.fill(
-            child: _isArMode
-                ? ARView(
-              onARViewCreated: onARViewCreated,
-              planeDetectionConfig: PlaneDetectionConfig.horizontalAndVertical,
-            )
-                : _isInitialized && _controller != null
+            child: _isInitialized && _controller != null
                 ? _buildCameraPreview()
                 : Container(
               color: Colors.black,
@@ -814,65 +885,52 @@ class _ScannerPageState extends State<ScannerPage> {
             ),
           ),
 
-          if (!_isArMode)
-            Positioned(
-              top: 0,
-              left: 0,
-              right: 0,
-              child: ClipRect(
-                child: BackdropFilter(
-                  filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
-                  child: Container(
-                    padding: EdgeInsets.only(
-                      top: MediaQuery.of(context).padding.top + 16,
-                      bottom: 20,
-                      left: 24,
-                      right: 24,
-                    ),
-                    color: brandNavy.withValues(alpha: 0.4),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        IconButton(
-                          onPressed: () => Navigator.pop(context),
-                          icon: const Icon(Icons.arrow_back_ios_new_rounded, color: Colors.white),
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: ClipRect(
+              child: BackdropFilter(
+                filter: ui.ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+                child: Container(
+                  padding: EdgeInsets.only(
+                    top: MediaQuery.of(context).padding.top + 16,
+                    bottom: 20,
+                    left: 24,
+                    right: 24,
+                  ),
+                  color: brandNavy.withValues(alpha: 0.4),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      IconButton(
+                        onPressed: () => Navigator.pop(context),
+                        icon: const Icon(Icons.arrow_back_ios_new_rounded, color: Colors.white),
+                      ),
+                      const Text(
+                        "Carbon Scanner",
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 20,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: -0.5,
                         ),
-                        const Text(
-                          "Carbon Scanner",
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 20,
-                            fontWeight: FontWeight.w900,
-                            letterSpacing: -0.5,
-                          ),
+                      ),
+                      IconButton(
+                        onPressed: _toggleFlash,
+                        icon: Icon(
+                          _isFlashOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
+                          color: _isFlashOn ? brandGreen : Colors.white,
                         ),
-                        IconButton(
-                          onPressed: _toggleFlash,
-                          icon: Icon(
-                            _isFlashOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
-                            color: _isFlashOn ? brandGreen : Colors.white,
-                          ),
-                        ),
-                      ],
-                    ),
+                      ),
+                    ],
                   ),
                 ),
               ),
             ),
+          ),
 
-          if (!_isDialogShowing && !_isArMode)
-            Center(
-              child: Container(
-                width: 260,
-                height: 260,
-                decoration: BoxDecoration(
-                  border: Border.all(color: brandGreen.withValues(alpha: 0.5), width: 2),
-                  borderRadius: BorderRadius.circular(40),
-                ),
-              ),
-            ),
-
-          if (!_isDialogShowing && !_isArMode)
+          if (!_isDialogShowing)
             Positioned(
               bottom: 60,
               left: 0,
@@ -881,7 +939,7 @@ class _ScannerPageState extends State<ScannerPage> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   GestureDetector(
-                    onTap: _runPipeline,
+                    onTap: () => _runPipeline(),
                     child: Container(
                       height: 84,
                       width: 84,
@@ -909,12 +967,14 @@ class _ScannerPageState extends State<ScannerPage> {
                   ),
                   const SizedBox(height: 24),
                   TextButton(
-                    onPressed: () {
-                      userProvider.setTabIndex(2);
-                      Navigator.pop(context);
+                    onPressed: () async {
+                      final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
+                      if (image != null) {
+                        _runPipeline(preSelectedImage: image);
+                      }
                     },
                     child: const Text(
-                      "ENTER MANUALLY",
+                      "UPLOAD IMAGE",
                       style: TextStyle(
                         color: Colors.white,
                         fontWeight: FontWeight.w900,
@@ -936,11 +996,13 @@ class _ProcessingDialog extends StatefulWidget {
   final Stream<PipelineUpdate> updateStream;
   final List<PipelineUpdate> initialLogs;
   final int initialProgress;
+  final VoidCallback onCancel;
 
   const _ProcessingDialog({
     required this.updateStream,
     this.initialLogs = const [],
     this.initialProgress = 0,
+    required this.onCancel,
   });
 
   @override
@@ -976,7 +1038,7 @@ class _ProcessingDialogState extends State<_ProcessingDialog> {
       backgroundColor: Colors.transparent,
       insetPadding: const EdgeInsets.symmetric(horizontal: 24),
       child: Container(
-        height: 480,
+        height: 520, // Increased height slightly to accommodate the new button
         decoration: BoxDecoration(
           color: Colors.white.withValues(alpha: 0.98),
           borderRadius: BorderRadius.circular(32),
@@ -1078,6 +1140,26 @@ class _ProcessingDialogState extends State<_ProcessingDialog> {
                     ),
                   );
                 },
+              ),
+            ),
+            const SizedBox(height: 16),
+            SizedBox(
+              width: double.infinity,
+              child: TextButton(
+                onPressed: widget.onCancel,
+                style: TextButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                  backgroundColor: Colors.red.withValues(alpha: 0.1),
+                ),
+                child: const Text(
+                  "CANCEL PROCESS",
+                  style: TextStyle(
+                    color: Colors.red,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 1.2,
+                  ),
+                ),
               ),
             ),
           ],

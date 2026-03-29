@@ -47,4 +47,9 @@ flutter {
 dependencies {
     implementation("androidx.core:core-ktx:1.13.1")
     implementation("androidx.appcompat:appcompat:1.6.1")
+    implementation("com.gorisse.thomas.sceneform:ux:1.23.0")
+}
+
+configurations.all {
+    exclude(group = "com.google.flatbuffers", module = "flatbuffers-java")
 }

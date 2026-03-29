@@ -15,3 +15,7 @@
 -dontwarn com.google.mlkit.vision.text.devanagari.**
 -dontwarn com.google.mlkit.vision.text.japanese.**
 -dontwarn com.google.mlkit.vision.text.korean.**
+
+-keep class org.tensorflow.** { *; }
+-keep class com.ultralytics.** { *; }
+-dontwarn org.tensorflow.**
