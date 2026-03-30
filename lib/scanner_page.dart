@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
+import 'package:flutter/foundation.dart'; // NEW: For compute() isolate threading
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
@@ -14,19 +15,47 @@ import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:http/http.dart' as http;
 import 'package:image/image.dart' as img;
 
-// NEW: For Image Uploads
 import 'package:image_picker/image_picker.dart';
-
-// Official OpenFoodFacts Package
 import 'package:openfoodfacts/openfoodfacts.dart';
-
-// Official Ultralytics YOLO Package
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 import 'package:ultralytics_yolo/yolo.dart';
 
 import 'user_provider.dart';
 
-// Pipeline Update Model
+// =========================================================================
+// BACKGROUND IMAGE PROCESSOR (Prevents UI Freezing & Fixes Aspect Ratio)
+// =========================================================================
+Future<Uint8List> prepareYoloImage(String path) async {
+  final bytes = await File(path).readAsBytes();
+  img.Image? decoded = img.decodeImage(bytes);
+  if (decoded == null) return bytes;
+
+  // 1. Bake the Android sensor orientation
+  decoded = img.bakeOrientation(decoded);
+
+  // 2. Force Portrait orientation if the sensor captured it sideways
+  if (decoded.width > decoded.height) {
+    decoded = img.copyRotate(decoded, angle: 90);
+  }
+
+  // 3. TRUE LETTERBOXING
+  // Create a square canvas matching the longest side
+  int maxSize = decoded.width > decoded.height ? decoded.width : decoded.height;
+  img.Image squareImage = img.Image(width: maxSize, height: maxSize);
+
+  // Fill the empty space with neutral grey (YOLO standard padding: 114, 114, 114)
+  img.fill(squareImage, color: img.ColorRgb8(114, 114, 114));
+
+  // Center the actual image inside the square
+  int xOffset = (maxSize - decoded.width) ~/ 2;
+  int yOffset = (maxSize - decoded.height) ~/ 2;
+  img.compositeImage(squareImage, decoded, dstX: xOffset, dstY: yOffset);
+
+  // Compress slightly to speed up C++ parsing
+  return img.encodeJpg(squareImage, quality: 85);
+}
+// =========================================================================
+
 class PipelineUpdate {
   final int progress;
   final String step;
@@ -48,31 +77,22 @@ class _ScannerPageState extends State<ScannerPage> {
   bool _isFlashOn = false;
   bool _isInitialized = false;
 
-  // Services & ML Components
   final TextRecognizer _textRecognizer = TextRecognizer();
-
-  // Upload & Cancel States
   final ImagePicker _picker = ImagePicker();
   bool _isCancelled = false;
 
-  // Integrated Carbon Estimator Components
   Interpreter? _gruInterpreter;
   Map<String, dynamic>? _lcaDatabase;
   Map<String, dynamic>? _scalerConfig;
-
-  // Ultralytics YOLO Instance
   YOLO? _yoloPlugin;
 
-  // Diagnostic String for the new Dialog
   String _diagnosticMessage = "Initializing systems...";
 
-  // Inference State
   bool _isDialogShowing = false;
   bool _isAnalyzing = false;
   String _detectedClass = "";
   double _carbonFootprint = 0.0;
 
-  // Stream & History for the Processing Dialog
   StreamController<PipelineUpdate>? _pipelineController;
   final List<PipelineUpdate> _pipelineHistory = [];
   int _currentPipelineProgress = 0;
@@ -80,6 +100,9 @@ class _ScannerPageState extends State<ScannerPage> {
   @override
   void initState() {
     super.initState();
+    // Protect against OpenFoodFacts 503 rate-limiting by providing a valid agent
+    OpenFoodAPIConfiguration.userAgent = UserAgent(name: 'CO2Minus_App', url: 'https://github.com/abvlnt');
+
     _initializeSystem().then((_) {
       if (mounted) {
         _checkShowInstructions();
@@ -90,7 +113,6 @@ class _ScannerPageState extends State<ScannerPage> {
   Future<void> _initializeSystem() async {
     String diag = "";
     try {
-      // 1. Load Camera
       final cameras = await availableCameras();
       if (cameras.isNotEmpty) {
         _controller = CameraController(
@@ -106,7 +128,6 @@ class _ScannerPageState extends State<ScannerPage> {
         diag += "❌ Camera Lens (Not Found)\n";
       }
 
-      // 2. Load JSON Databases
       try {
         final lcaString = await rootBundle.loadString('assets/flutter_lca_database.json');
         _lcaDatabase = json.decode(lcaString);
@@ -119,9 +140,7 @@ class _ScannerPageState extends State<ScannerPage> {
         diag += "❌ JSON Databases Error: $e\n";
       }
 
-      // 3. Load YOLO26 Model (Ultralytics Package)
       try {
-        // Extract model to physical storage so C++ backend can read it
         final byteData = await rootBundle.load('assets/models/yolo.tflite');
         final file = File('${Directory.systemTemp.path}/yolo.tflite');
         await file.writeAsBytes(byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes));
@@ -136,16 +155,12 @@ class _ScannerPageState extends State<ScannerPage> {
         diag += "❌ YOLO26 Model Error: $e\n";
       }
 
-      // 4. Load GRU Model
       try {
         _gruInterpreter = await Interpreter.fromAsset('assets/models/gru.tflite');
         diag += "✅ GRU Estimation Model\n";
       } catch (e) {
         diag += "❌ GRU Model Error: $e\n";
       }
-
-      // Initialize OpenFoodFacts UserAgent
-      OpenFoodAPIConfiguration.userAgent = UserAgent(name: 'CO2Minus_App');
 
     } catch (e) {
       diag += "\nCritical System Error: $e";
@@ -266,47 +281,42 @@ class _ScannerPageState extends State<ScannerPage> {
     });
   }
 
-  // --- YOLO26 ULTRALYTICS INFERENCE ---
+  // --- YOLO26 ULTRALYTICS INFERENCE WITH BACKGROUND LETTERBOXING ---
   Future<String?> _runYoloInference(String imagePath) async {
     if (_yoloPlugin == null) return null;
 
     try {
-      final bytes = await File(imagePath).readAsBytes();
+      // Offload to background isolate to prevent UI freezing
+      final Uint8List fixedBytes = await compute(prepareYoloImage, imagePath);
 
-      img.Image? decodedImage = img.decodeImage(bytes);
-      if (decodedImage != null) {
-        decodedImage = img.bakeOrientation(decodedImage);
-        final Uint8List fixedBytes = img.encodeJpg(decodedImage);
+      final resultsMap = await _yoloPlugin!.predict(
+        fixedBytes,
+        confidenceThreshold: 0.15,
+      );
 
-        final resultsMap = await _yoloPlugin!.predict(
-          fixedBytes,
-          confidenceThreshold: 0.15,
-        );
+      if (resultsMap.isNotEmpty) {
+        double bestConf = 0.0;
+        String bestLabel = "";
 
-        if (resultsMap.isNotEmpty) {
-          double bestConf = 0.0;
-          String bestLabel = "";
+        resultsMap.forEach((key, value) {
+          if (value is List) {
+            for (var item in value) {
+              if (item is Map) {
+                double conf = (item['confidence'] ?? item['score'] ?? 0.0).toDouble();
+                String label = (item['className'] ?? item['label'] ?? item['class'] ?? "").toString();
 
-          resultsMap.forEach((key, value) {
-            if (value is List) {
-              for (var item in value) {
-                if (item is Map) {
-                  double conf = (item['confidence'] ?? item['score'] ?? 0.0).toDouble();
-                  String label = (item['className'] ?? item['label'] ?? item['class'] ?? "").toString();
-
-                  if (conf > bestConf && label.isNotEmpty) {
-                    bestConf = conf;
-                    bestLabel = label;
-                  }
+                if (conf > bestConf && label.isNotEmpty) {
+                  bestConf = conf;
+                  bestLabel = label;
                 }
               }
             }
-          });
-
-          if (bestLabel.isNotEmpty) {
-            debugPrint("🎯 Best Native Match: $bestLabel | ${(bestConf * 100).toStringAsFixed(1)}%");
-            return bestLabel;
           }
+        });
+
+        if (bestLabel.isNotEmpty) {
+          debugPrint("🎯 Corrected Match: $bestLabel | ${(bestConf * 100).toStringAsFixed(1)}%");
+          return bestLabel;
         }
       }
       return null;
@@ -319,12 +329,10 @@ class _ScannerPageState extends State<ScannerPage> {
   // --- INTEGRATED GRU ESTIMATOR ---
   Future<double?> _estimateCarbonFootprint(String yoloClass, double weightKg) async {
     if (_gruInterpreter == null || _lcaDatabase == null || _scalerConfig == null) {
-      debugPrint("GRU Error: Services not fully initialized.");
       return null;
     }
 
     if (!_lcaDatabase!.containsKey(yoloClass)) {
-      debugPrint("GRU Error: Class '$yoloClass' missing from LCA database.");
       return null;
     }
 
@@ -391,9 +399,6 @@ class _ScannerPageState extends State<ScannerPage> {
       } else {
         _emitUpdate(75, "3. True Depth (AR)", "Laser failed. Using 30cm baseline.");
       }
-    } on PlatformException catch (e) {
-      debugPrint("Native AR Error: ${e.message}");
-      _emitUpdate(75, "3. True Depth (AR)", "Native sensor error. Using 30cm baseline.");
     } catch (e) {
       debugPrint("Native AR Missing Plugin Error: $e");
       _emitUpdate(75, "3. True Depth (AR)", "AR Module bypassed. Using 30cm baseline.");
@@ -504,7 +509,7 @@ class _ScannerPageState extends State<ScannerPage> {
     setState(() {
       _isAnalyzing = true;
       _isDialogShowing = true;
-      _isCancelled = false; // Reset on start
+      _isCancelled = false;
     });
 
     _pipelineHistory.clear();
@@ -554,7 +559,7 @@ class _ScannerPageState extends State<ScannerPage> {
 
         for (int i = 0; i < 5; i++) {
           if (_isCancelled) throw Exception("cancelled_by_user");
-          _emitUpdate(10 + (i * 6), "1. Vision Model (YOLO26)", "Pass ${i + 1}: Analyzing frame natively...");
+          _emitUpdate(10 + (i * 6), "1. Vision Model (YOLO26)", "Pass ${i + 1}: Analyzing geometry...");
           finalImage = capturedFrames[i];
 
           String? yoloResult = await _runYoloInference(finalImage.path);
@@ -587,7 +592,7 @@ class _ScannerPageState extends State<ScannerPage> {
       String ocrText = recognizedText.text.replaceAll('\n', ' ').toLowerCase();
 
       // =========================================================================
-      // SPATIAL OCR SORTING
+      // DYNAMIC OCR UPGRADE: Sort text physically and grab the top 5 largest blocks
       // =========================================================================
       List<TextBlock> sortedBlocks = recognizedText.blocks.toList();
       sortedBlocks.sort((a, b) {
@@ -597,13 +602,16 @@ class _ScannerPageState extends State<ScannerPage> {
       });
 
       List<String> prominentText = [];
-      for (var block in sortedBlocks.take(3)) {
+      for (var block in sortedBlocks) {
         String text = block.text.replaceAll('\n', ' ').trim();
         if (text.length > 2 && !text.toLowerCase().contains("net") && !text.toLowerCase().contains("weight")) {
           prominentText.add(text);
         }
       }
-      String ocrSearchContext = prominentText.join(' ');
+
+      // Grab top 5 words (Usually Brand + Flavor + Style)
+      String ocrSearchContext = prominentText.take(5).join(' ');
+      String detectedBrand = prominentText.isNotEmpty ? prominentText.first.toUpperCase() : "Unknown";
       // =========================================================================
 
       if (_isCancelled) throw Exception("cancelled_by_user");
@@ -629,22 +637,14 @@ class _ScannerPageState extends State<ScannerPage> {
         }
       }
 
-      List<String> knownBrands = ['nestle', 'coca-cola', 'coke', 'pepsi', 'unilever', 'p&g', 'monde', 'san miguel', 'urc', 'del monte', 'century', 'purefoods', 'oishi', 'jack n jill'];
-      String detectedBrand = "Unknown";
-      for (String brand in knownBrands) {
-        if (ocrText.contains(brand)) {
-          detectedBrand = brand.toUpperCase();
-          break;
-        }
-      }
-
       // STEP 2.5: OPEN FOOD FACTS CLOUD API FALLBACK
       if (!ocrWeightFound) {
         _emitUpdate(58, "2. Cloud API Fallback", "Local OCR failed. Querying OpenFacts DB...");
 
+        // CRITICAL: Search only using OCR labels. Never append YOLO class if OCR is found!
         String searchQuery = ocrSearchContext.isNotEmpty
-            ? "$ocrSearchContext ${currentDetectedClass.replaceAll('_', ' ')}"
-            : (detectedBrand != "Unknown" ? "$detectedBrand ${currentDetectedClass.replaceAll('_', ' ')}" : currentDetectedClass.replaceAll('_', ' '));
+            ? ocrSearchContext
+            : currentDetectedClass.replaceAll('_', ' ');
 
         try {
           ProductSearchQueryConfiguration configuration = ProductSearchQueryConfiguration(
@@ -688,7 +688,7 @@ class _ScannerPageState extends State<ScannerPage> {
           }
         } catch (e) {
           debugPrint("OpenFoodFacts DB Fetch Error: $e");
-          _emitUpdate(62, "2. Cloud API", "Cloud fetch failed. Proceeding to AR.");
+          _emitUpdate(62, "2. Cloud API", "Cloud server busy. Proceeding to AR.");
         }
       }
 
@@ -767,7 +767,7 @@ class _ScannerPageState extends State<ScannerPage> {
     } catch (e) {
       if (e.toString().contains("cancelled_by_user")) {
         debugPrint("Pipeline gracefully aborted by user.");
-        return; // Exit silently
+        return;
       }
 
       debugPrint("Pipeline Error: $e");
