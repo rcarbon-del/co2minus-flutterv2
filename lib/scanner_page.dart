@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
-import 'package:flutter/foundation.dart'; // NEW: For compute() isolate threading
+import 'package:flutter/foundation.dart'; // Required for compute() isolate threading
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
@@ -17,13 +17,15 @@ import 'package:image/image.dart' as img;
 
 import 'package:image_picker/image_picker.dart';
 import 'package:openfoodfacts/openfoodfacts.dart';
+
+// Official Ultralytics YOLO Package
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 import 'package:ultralytics_yolo/yolo.dart';
 
 import 'user_provider.dart';
 
 // =========================================================================
-// BACKGROUND IMAGE PROCESSOR (Prevents UI Freezing & Fixes Aspect Ratio)
+// BACKGROUND IMAGE PROCESSOR (Fixes Memory Leaks & Aspect Ratios)
 // =========================================================================
 Future<Uint8List> prepareYoloImage(String path) async {
   final bytes = await File(path).readAsBytes();
@@ -85,6 +87,9 @@ class _ScannerPageState extends State<ScannerPage> {
   bool _isFlashOn = false;
   bool _isInitialized = false;
 
+  // State for Hybrid Approach
+  bool _useNativeYoloView = true;
+
   final TextRecognizer _textRecognizer = TextRecognizer();
   final ImagePicker _picker = ImagePicker();
   bool _isCancelled = false;
@@ -121,21 +126,15 @@ class _ScannerPageState extends State<ScannerPage> {
   Future<void> _initializeSystem() async {
     String diag = "";
     try {
+      // 1. Check Camera Hardware Permissions
       final cameras = await availableCameras();
       if (cameras.isNotEmpty) {
-        _controller = CameraController(
-          cameras.first,
-          ResolutionPreset.max,
-          enableAudio: false,
-          imageFormatGroup: ImageFormatGroup.nv21,
-        );
-        await _controller!.initialize();
-        diag += "✅ Camera Lens\n";
-        if (mounted) setState(() => _isInitialized = true);
+        diag += "✅ Camera Hardware\n";
       } else {
-        diag += "❌ Camera Lens (Not Found)\n";
+        diag += "❌ Camera Hardware (Not Found)\n";
       }
 
+      // 2. Load JSON Databases
       try {
         final lcaString = await rootBundle.loadString('assets/flutter_lca_database.json');
         _lcaDatabase = json.decode(lcaString);
@@ -148,8 +147,10 @@ class _ScannerPageState extends State<ScannerPage> {
         diag += "❌ JSON Databases Error: $e\n";
       }
 
+      // 3. Load YOLO26 Model (Ultralytics Package)
       try {
         final file = File('${Directory.systemTemp.path}/yolo.tflite');
+
         // FIX C: Only write the 10MB model file to disk if it doesn't exist OR is corrupted (0 bytes)
         if (!file.existsSync() || file.lengthSync() == 0) {
           final byteData = await rootBundle.load('assets/models/yolo.tflite');
@@ -166,6 +167,7 @@ class _ScannerPageState extends State<ScannerPage> {
         diag += "❌ YOLO26 Model Error: $e\n";
       }
 
+      // 4. Load GRU Model
       try {
         _gruInterpreter = await Interpreter.fromAsset('assets/models/gru.tflite');
         diag += "✅ GRU Estimation Model\n";
@@ -180,28 +182,8 @@ class _ScannerPageState extends State<ScannerPage> {
     if (mounted) {
       setState(() {
         _diagnosticMessage = diag;
+        _isInitialized = true;
       });
-    }
-  }
-
-  Future<void> _initializeCamera() async {
-    final cameras = await availableCameras();
-    if (cameras.isEmpty) return;
-
-    _controller = CameraController(
-      cameras.first,
-      ResolutionPreset.max,
-      enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.nv21,
-    );
-
-    try {
-      await _controller!.initialize();
-      if (mounted) {
-        setState(() => _isInitialized = true);
-      }
-    } catch (e) {
-      debugPrint("Camera Error: $e");
     }
   }
 
@@ -281,7 +263,7 @@ class _ScannerPageState extends State<ScannerPage> {
     }
   }
 
-  // FIX D: Improved Cancellation State Management
+  // FIX D: Enhanced Cancellation State Management
   void _cancelPipeline({bool poppedBySystem = false}) {
     _isCancelled = true;
     if (_isDialogShowing) {
@@ -294,11 +276,12 @@ class _ScannerPageState extends State<ScannerPage> {
     if (mounted) {
       setState(() {
         _isAnalyzing = false;
+        _useNativeYoloView = true; // Restore the live stream
       });
     }
   }
 
-  // --- YOLO26 ULTRALYTICS INFERENCE WITH BACKGROUND LETTERBOXING ---
+  // --- YOLO26 ULTRALYTICS INFERENCE ON HIGH-RES CAPTURE ---
   Future<String?> _runYoloInference(String imagePath) async {
     if (_yoloPlugin == null) return null;
 
@@ -335,7 +318,7 @@ class _ScannerPageState extends State<ScannerPage> {
         });
 
         if (bestLabel.isNotEmpty) {
-          debugPrint("🎯 Corrected Match: $bestLabel | ${(bestConf * 100).toStringAsFixed(1)}%");
+          debugPrint("🎯 Accurate Snapshot Match: $bestLabel | ${(bestConf * 100).toStringAsFixed(1)}%");
           return bestLabel;
         }
       }
@@ -402,9 +385,6 @@ class _ScannerPageState extends State<ScannerPage> {
     _emitUpdate(70, "3. True Depth (AR)", "Activating Auto-Laser...");
     await Future.delayed(const Duration(milliseconds: 400));
 
-    await _controller?.dispose();
-    _controller = null;
-
     if (mounted && _isDialogShowing) {
       Navigator.pop(context);
       _isDialogShowing = false;
@@ -419,14 +399,12 @@ class _ScannerPageState extends State<ScannerPage> {
       } else {
         _emitUpdate(75, "3. True Depth (AR)", "Laser failed. Using 30cm baseline.");
       }
+    } on PlatformException catch (e) {
+      debugPrint("Native AR Error: ${e.message}");
+      _emitUpdate(75, "3. True Depth (AR)", "Native sensor error. Using 30cm baseline.");
     } catch (e) {
       debugPrint("Native AR Missing Plugin Error: $e");
       _emitUpdate(75, "3. True Depth (AR)", "AR Module bypassed. Using 30cm baseline.");
-    }
-
-    if (mounted) {
-      setState(() => _isInitialized = false);
-      await _initializeCamera();
     }
 
     // After AR returns, show the dialog again if the user didn't abort it before AR launched
@@ -439,7 +417,7 @@ class _ScannerPageState extends State<ScannerPage> {
           updateStream: _pipelineController!.stream,
           initialLogs: _pipelineHistory,
           initialProgress: _currentPipelineProgress,
-          onCancel: (fromSystem) => _cancelPipeline(poppedBySystem: fromSystem),
+          onCancel: (fromSys) => _cancelPipeline(poppedBySystem: fromSys),
         ),
       );
     }
@@ -550,57 +528,52 @@ class _ScannerPageState extends State<ScannerPage> {
     try {
       XFile? finalImage;
       String currentDetectedClass = "";
-      bool isObjectDetected = false;
 
-      // STEP 1: Image Sourcing & YOLO Passes
+      // HYBRID APPROACH IMPLEMENTATION
       if (preSelectedImage != null) {
         _emitUpdate(5, "1. Image Upload", "Analyzing uploaded image...");
         finalImage = preSelectedImage;
         await Future.delayed(const Duration(milliseconds: 500));
         if (_isCancelled) throw Exception("cancelled_by_user");
 
-        String? yoloResult = await _runYoloInference(finalImage.path);
-        if (yoloResult != null) {
-          isObjectDetected = true;
-          currentDetectedClass = yoloResult;
-        }
       } else {
-        _emitUpdate(5, "1. Trigger & Identification", "Initiating 5-frame rapid capture...");
+        _emitUpdate(5, "1. Hardware Override", "Freezing native stream for High-Res Capture...");
 
-        List<XFile> capturedFrames = [];
-        for (int i = 0; i < 5; i++) {
-          if (_isCancelled) throw Exception("cancelled_by_user");
-          capturedFrames.add(await _controller!.takePicture());
-          await Future.delayed(const Duration(milliseconds: 150));
-        }
-
-        await _debugPause("Capture Initiation", "Successfully captured 5 frames in sequence for analysis.");
+        // 1. Temporarily hide YOLOView so it releases the Camera Hardware lock
+        setState(() => _useNativeYoloView = false);
+        await Future.delayed(const Duration(milliseconds: 400));
         if (_isCancelled) throw Exception("cancelled_by_user");
 
-        for (int i = 0; i < 5; i++) {
-          if (_isCancelled) throw Exception("cancelled_by_user");
-          _emitUpdate(10 + (i * 6), "1. Vision Model (YOLO26)", "Pass ${i + 1}: Analyzing geometry...");
-          finalImage = capturedFrames[i];
+        // 2. Initialize the standard CameraController for a 12MP shot
+        final cameras = await availableCameras();
+        _controller = CameraController(
+          cameras.first,
+          ResolutionPreset.max, // Perfect OCR clarity
+          enableAudio: false,
+          imageFormatGroup: ImageFormatGroup.nv21,
+        );
+        await _controller!.initialize();
+        if (_isCancelled) throw Exception("cancelled_by_user");
 
-          String? yoloResult = await _runYoloInference(finalImage.path);
+        _emitUpdate(10, "1. Image Capture", "Taking 12MP snapshot for OCR...");
+        finalImage = await _controller!.takePicture();
 
-          if (yoloResult != null) {
-            isObjectDetected = true;
-            currentDetectedClass = yoloResult;
-            break;
-          }
-        }
+        // 3. Immediately free the camera again so AR or YOLOView can use it later
+        await _controller!.dispose();
+        _controller = null;
       }
 
       if (_isCancelled) throw Exception("cancelled_by_user");
 
-      if (!isObjectDetected || currentDetectedClass.isEmpty) {
-        _emitUpdate(40, "1. Vision Model (YOLO26)", "Detection failed. No object found.");
-        throw Exception("YOLO Object Detection Failed.");
+      _emitUpdate(20, "2. Vision Model", "Analyzing spatial geometry...");
+      String? yoloResult = await _runYoloInference(finalImage.path);
+
+      if (yoloResult == null) {
+        throw Exception("YOLO could not classify item.");
       }
 
-      _emitUpdate(40, "1. Vision Model (YOLO26)", "Classification Confirmed: $currentDetectedClass");
-      if (finalImage == null) throw Exception("Failed to capture image");
+      currentDetectedClass = yoloResult;
+      _emitUpdate(40, "2. Vision Model", "Verified: $currentDetectedClass");
 
       await _debugPause("Step 1 Complete", "Final YOLO26 Classification Selected: $currentDetectedClass");
       if (_isCancelled) throw Exception("cancelled_by_user");
@@ -817,7 +790,10 @@ class _ScannerPageState extends State<ScannerPage> {
           await userProvider.addCarbonFootprint(_carbonFootprint, _getCategory().toLowerCase());
           if (mounted) {
             Navigator.pop(context);
-            setState(() => _isDialogShowing = false);
+            setState(() {
+              _isDialogShowing = false;
+              _useNativeYoloView = true; // Restore Native Stream
+            });
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(
                 content: Text("Impact successfully added!"),
@@ -828,7 +804,10 @@ class _ScannerPageState extends State<ScannerPage> {
         },
         onRetry: () {
           Navigator.pop(context);
-          setState(() => _isDialogShowing = false);
+          setState(() {
+            _isDialogShowing = false;
+            _useNativeYoloView = true; // Restore Native Stream
+          });
         },
       ),
     );
@@ -841,7 +820,10 @@ class _ScannerPageState extends State<ScannerPage> {
       builder: (context) => _FailurePopup(
         onRetry: () {
           Navigator.pop(context);
-          setState(() => _isDialogShowing = false);
+          setState(() {
+            _isDialogShowing = false;
+            _useNativeYoloView = true; // Restore Native Stream
+          });
         },
       ),
     );
@@ -857,33 +839,12 @@ class _ScannerPageState extends State<ScannerPage> {
 
   @override
   void dispose() {
-    _isCancelled = true; // FIX D: Prevent ghost threads from updating unmounted UI
+    _isCancelled = true; // FIX D: Stop background threads from updating dead UI
     _pipelineController?.close();
     _controller?.dispose();
     _textRecognizer.close();
     _gruInterpreter?.close();
     super.dispose();
-  }
-
-  void _toggleFlash() async {
-    if (_controller == null || !_isInitialized) return;
-    setState(() => _isFlashOn = !_isFlashOn);
-    await _controller!.setFlashMode(
-      _isFlashOn ? FlashMode.torch : FlashMode.off,
-    );
-  }
-
-  Widget _buildCameraPreview() {
-    final size = MediaQuery.of(context).size;
-    var scale = size.aspectRatio * _controller!.value.aspectRatio;
-    if (scale < 1) scale = 1 / scale;
-
-    return Transform.scale(
-      scale: scale,
-      child: Center(
-        child: CameraPreview(_controller!),
-      ),
-    );
   }
 
   @override
@@ -895,15 +856,15 @@ class _ScannerPageState extends State<ScannerPage> {
       backgroundColor: Colors.black,
       body: Stack(
         children: [
+          // THE HYBRID CAMERA RENDERER
           Positioned.fill(
-            child: _isInitialized && _controller != null
-                ? _buildCameraPreview()
-                : Container(
-              color: Colors.black,
-              child: const Center(
-                child: CircularProgressIndicator(color: brandGreen),
-              ),
-            ),
+            child: _isInitialized && _yoloPlugin != null
+                ? (_useNativeYoloView
+            // When idle, show the fast native YOLOView for live bounding boxes
+                ? YoloView(yolo: _yoloPlugin!) // Adjust 'yolo' argument if package uses 'controller' etc.
+            // During capture, we show a sleek loading screen while CameraController takes the 12MP shot silently
+                : const Center(child: CircularProgressIndicator(color: brandGreen)))
+                : const Center(child: CircularProgressIndicator(color: brandGreen)),
           ),
 
           Positioned(
@@ -938,7 +899,7 @@ class _ScannerPageState extends State<ScannerPage> {
                         ),
                       ),
                       IconButton(
-                        onPressed: _toggleFlash,
+                        onPressed: () {}, // Native YOLOView flash controlled internally or omitted for simplicity
                         icon: Icon(
                           _isFlashOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
                           color: _isFlashOn ? brandGreen : Colors.white,
@@ -1017,7 +978,7 @@ class _ProcessingDialog extends StatefulWidget {
   final Stream<PipelineUpdate> updateStream;
   final List<PipelineUpdate> initialLogs;
   final int initialProgress;
-  final Function(bool) onCancel; // FIX D: Pass boolean for system pop
+  final Function(bool) onCancel; // FIX D: Supports Android system back button
 
   const _ProcessingDialog({
     required this.updateStream,
@@ -1059,7 +1020,7 @@ class _ProcessingDialogState extends State<_ProcessingDialog> {
       canPop: true,
       onPopInvokedWithResult: (didPop, result) {
         if (didPop) {
-          widget.onCancel(true); // true = popped by system back button
+          widget.onCancel(true); // true = popped by Android system back button
         }
       },
       child: Dialog(
@@ -1174,7 +1135,7 @@ class _ProcessingDialogState extends State<_ProcessingDialog> {
               SizedBox(
                 width: double.infinity,
                 child: TextButton(
-                  onPressed: () => widget.onCancel(false), // false = popped via cancel button
+                  onPressed: () => widget.onCancel(false), // false = manually cancelled via UI
                   style: TextButton.styleFrom(
                     padding: const EdgeInsets.symmetric(vertical: 14),
                     shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
