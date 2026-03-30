@@ -3,7 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'dart:ui' as ui;
-import 'package:flutter/foundation.dart'; // Required for compute() isolate threading
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
@@ -11,37 +11,31 @@ import 'package:camera/camera.dart';
 import 'package:google_mlkit_text_recognition/google_mlkit_text_recognition.dart';
 import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-import 'package:tflite_flutter/tflite_flutter.dart';
-import 'package:http/http.dart' as http;
-import 'package:image/image.dart' as img;
-
 import 'package:image_picker/image_picker.dart';
 import 'package:openfoodfacts/openfoodfacts.dart';
 
-// Official Ultralytics YOLO Package
+// Google LiteRT (Formerly TensorFlow Lite Flutter)
+import 'package:litert/litert.dart';
+
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 import 'package:ultralytics_yolo/yolo.dart';
+import 'package:ultralytics_yolo/yolo_view.dart';
 
 import 'user_provider.dart';
 
 // =========================================================================
-// BACKGROUND IMAGE PROCESSOR (Fixes Memory Leaks & Aspect Ratios)
+// BACKGROUND IMAGE PROCESSOR (Used purely for Uploaded Images now)
 // =========================================================================
 Future<Uint8List> prepareYoloImage(String path) async {
   final bytes = await File(path).readAsBytes();
   img.Image? decoded = img.decodeImage(bytes);
   if (decoded == null) return bytes;
 
-  // 1. Bake the Android sensor orientation
   decoded = img.bakeOrientation(decoded);
-
-  // 2. Force Portrait orientation if the sensor captured it sideways
   if (decoded.width > decoded.height) {
     decoded = img.copyRotate(decoded, angle: 90);
   }
 
-  // 3. SCALE DOWN BEFORE PADDING (Fixes the Massive RAM/Freeze Bug)
-  // YOLO26 requires a 640x640 tensor. We scale the longest side down to 640 first!
   int targetSize = 640;
   double scale = targetSize / (decoded.width > decoded.height ? decoded.width : decoded.height);
   int newWidth = (decoded.width * scale).toInt();
@@ -49,19 +43,13 @@ Future<Uint8List> prepareYoloImage(String path) async {
 
   img.Image resizedImage = img.copyResize(decoded, width: newWidth, height: newHeight);
 
-  // 4. TRUE LETTERBOXING
-  // Create the 640x640 square canvas
   img.Image squareImage = img.Image(width: targetSize, height: targetSize);
-
-  // Fill the empty space with neutral grey (YOLO standard padding: 114, 114, 114)
   img.fill(squareImage, color: img.ColorRgb8(114, 114, 114));
 
-  // Center the resized image inside the square
   int xOffset = (targetSize - newWidth) ~/ 2;
   int yOffset = (targetSize - newHeight) ~/ 2;
   img.compositeImage(squareImage, resizedImage, dstX: xOffset, dstY: yOffset);
 
-  // Compress slightly to speed up C++ parsing
   return img.encodeJpg(squareImage, quality: 85);
 }
 // =========================================================================
@@ -81,14 +69,15 @@ class ScannerPage extends StatefulWidget {
 }
 
 class _ScannerPageState extends State<ScannerPage> {
-  static const platform = MethodChannel('co2minus.app/ar_depth');
-
   CameraController? _controller;
   bool _isFlashOn = false;
   bool _isInitialized = false;
 
   // State for Hybrid Approach
   bool _useNativeYoloView = true;
+  String _liveDetectedClass = "";
+  double _liveDetectedConf = 0.0;
+  DateTime? _lastDetectionTime;
 
   final TextRecognizer _textRecognizer = TextRecognizer();
   final ImagePicker _picker = ImagePicker();
@@ -113,7 +102,6 @@ class _ScannerPageState extends State<ScannerPage> {
   @override
   void initState() {
     super.initState();
-    // Protect against OpenFoodFacts 503 rate-limiting by providing a valid agent
     OpenFoodAPIConfiguration.userAgent = UserAgent(name: 'CO2Minus_App', url: 'https://github.com/abvlnt');
 
     _initializeSystem().then((_) {
@@ -126,7 +114,6 @@ class _ScannerPageState extends State<ScannerPage> {
   Future<void> _initializeSystem() async {
     String diag = "";
     try {
-      // 1. Check Camera Hardware Permissions
       final cameras = await availableCameras();
       if (cameras.isNotEmpty) {
         diag += "✅ Camera Hardware\n";
@@ -134,7 +121,6 @@ class _ScannerPageState extends State<ScannerPage> {
         diag += "❌ Camera Hardware (Not Found)\n";
       }
 
-      // 2. Load JSON Databases
       try {
         final lcaString = await rootBundle.loadString('assets/flutter_lca_database.json');
         _lcaDatabase = json.decode(lcaString);
@@ -147,11 +133,8 @@ class _ScannerPageState extends State<ScannerPage> {
         diag += "❌ JSON Databases Error: $e\n";
       }
 
-      // 3. Load YOLO26 Model (Ultralytics Package)
       try {
         final file = File('${Directory.systemTemp.path}/yolo.tflite');
-
-        // FIX C: Only write the 10MB model file to disk if it doesn't exist OR is corrupted (0 bytes)
         if (!file.existsSync() || file.lengthSync() == 0) {
           final byteData = await rootBundle.load('assets/models/yolo.tflite');
           await file.writeAsBytes(byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes));
@@ -167,10 +150,9 @@ class _ScannerPageState extends State<ScannerPage> {
         diag += "❌ YOLO26 Model Error: $e\n";
       }
 
-      // 4. Load GRU Model
       try {
         _gruInterpreter = await Interpreter.fromAsset('assets/models/gru.tflite');
-        diag += "✅ GRU Estimation Model\n";
+        diag += "✅ GRU Estimation Model (LiteRT)\n";
       } catch (e) {
         diag += "❌ GRU Model Error: $e\n";
       }
@@ -263,12 +245,10 @@ class _ScannerPageState extends State<ScannerPage> {
     }
   }
 
-  // FIX D: Enhanced Cancellation State Management
   void _cancelPipeline({bool poppedBySystem = false}) {
     _isCancelled = true;
     if (_isDialogShowing) {
       _isDialogShowing = false;
-      // If the system back button popped the dialog, we don't need to pop again.
       if (!poppedBySystem && mounted) {
         Navigator.pop(context);
       }
@@ -281,15 +261,10 @@ class _ScannerPageState extends State<ScannerPage> {
     }
   }
 
-  // --- YOLO26 ULTRALYTICS INFERENCE ON HIGH-RES CAPTURE ---
   Future<String?> _runYoloInference(String imagePath) async {
     if (_yoloPlugin == null) return null;
-
     try {
-      // Offload to background isolate to prevent UI freezing
       final Uint8List fixedBytes = await compute(prepareYoloImage, imagePath);
-
-      // FIX D: Stop pipeline if user canceled OR exited the page during heavy processing!
       if (!mounted || _isCancelled) return null;
 
       final resultsMap = await _yoloPlugin!.predict(
@@ -316,11 +291,7 @@ class _ScannerPageState extends State<ScannerPage> {
             }
           }
         });
-
-        if (bestLabel.isNotEmpty) {
-          debugPrint("🎯 Accurate Snapshot Match: $bestLabel | ${(bestConf * 100).toStringAsFixed(1)}%");
-          return bestLabel;
-        }
+        if (bestLabel.isNotEmpty) return bestLabel;
       }
       return null;
     } catch (e) {
@@ -329,100 +300,42 @@ class _ScannerPageState extends State<ScannerPage> {
     }
   }
 
-  // --- INTEGRATED GRU ESTIMATOR ---
   Future<double?> _estimateCarbonFootprint(String yoloClass, double weightKg) async {
-    if (_gruInterpreter == null || _lcaDatabase == null || _scalerConfig == null) {
-      return null;
-    }
-
-    if (!_lcaDatabase!.containsKey(yoloClass)) {
-      return null;
-    }
+    if (_gruInterpreter == null || _lcaDatabase == null || _scalerConfig == null) return null;
+    if (!_lcaDatabase!.containsKey(yoloClass)) return null;
 
     try {
       List<dynamic> baseLca = _lcaDatabase![yoloClass];
       List<double> actualLca = baseLca.map((val) => (val as double) * weightKg).toList();
-
       List<dynamic> scaleVals = _scalerConfig!['scale_vals'];
       List<dynamic> minOffsets = _scalerConfig!['min_offsets'];
 
       List<double> scaledLca = [];
       for (int i = 0; i < actualLca.length; i++) {
-        double scaledValue = (actualLca[i] * scaleVals[i]) + minOffsets[i];
-        scaledLca.add(scaledValue);
+        scaledLca.add((actualLca[i] * scaleVals[i]) + minOffsets[i]);
       }
 
-      var inputTensor = [
-        scaledLca.map((val) => [val]).toList()
-      ];
-
+      var inputTensor = [scaledLca.map((val) => [val]).toList()];
       var outputTensor = List.filled(1 * 1, 0.0).reshape([1, 1]);
 
       _gruInterpreter!.run(inputTensor, outputTensor);
-
       double finalCarbonFootprint = outputTensor[0][0];
 
-      if (finalCarbonFootprint.isNaN) {
-        return null;
-      }
-
+      if (finalCarbonFootprint.isNaN) return null;
       return finalCarbonFootprint;
-
     } catch (e) {
       debugPrint("GRU Inference failed dynamically: $e");
       return null;
     }
   }
 
-  // --- AUTOMATED TRUE DEPTH SCALING ---
-  Future<double> _estimateWeightViaAR(String detectedClass) async {
-    double depthToItemCm = 30.0;
-
-    _emitUpdate(65, "3. True Depth (AR)", "⚠️ PLEASE HOLD DEVICE PERFECTLY STILL ⚠️");
-    await Future.delayed(const Duration(milliseconds: 1500));
+  // --- AUTOMATED VOLUMETRIC SCALING (AR Axed) ---
+  Future<double> _estimateWeightVolumetrically(String detectedClass) async {
+    _emitUpdate(65, "5. Volumetric Scaling", "Estimating mass based on product category...");
+    await Future.delayed(const Duration(milliseconds: 600));
     if (_isCancelled) throw Exception("cancelled_by_user");
 
-    _emitUpdate(70, "3. True Depth (AR)", "Activating Auto-Laser...");
-    await Future.delayed(const Duration(milliseconds: 400));
-
-    if (mounted && _isDialogShowing) {
-      Navigator.pop(context);
-      _isDialogShowing = false;
-    }
-
-    try {
-      final double? result = await platform.invokeMethod('measureDepth');
-
-      if (result != null && result > 0) {
-        depthToItemCm = result;
-        _emitUpdate(75, "3. True Depth (AR)", "Auto-laser hit! Depth locked at ${depthToItemCm.toStringAsFixed(1)} cm");
-      } else {
-        _emitUpdate(75, "3. True Depth (AR)", "Laser failed. Using 30cm baseline.");
-      }
-    } on PlatformException catch (e) {
-      debugPrint("Native AR Error: ${e.message}");
-      _emitUpdate(75, "3. True Depth (AR)", "Native sensor error. Using 30cm baseline.");
-    } catch (e) {
-      debugPrint("Native AR Missing Plugin Error: $e");
-      _emitUpdate(75, "3. True Depth (AR)", "AR Module bypassed. Using 30cm baseline.");
-    }
-
-    // After AR returns, show the dialog again if the user didn't abort it before AR launched
-    if (mounted && !_isDialogShowing && !_isCancelled) {
-      _isDialogShowing = true;
-      showDialog(
-        context: context,
-        barrierDismissible: false,
-        builder: (context) => _ProcessingDialog(
-          updateStream: _pipelineController!.stream,
-          initialLogs: _pipelineHistory,
-          initialProgress: _currentPipelineProgress,
-          onCancel: (fromSys) => _cancelPipeline(poppedBySystem: fromSys),
-        ),
-      );
-    }
-
-    // Exact Volumetric Scaling
+    // Exact Volumetric Scaling Constants (Defaulting to standard 30cm distance parameters)
     double widthCm = 0.0; double heightCm = 0.0; double depthCm = 0.0;
     double densityGCm3 = 1.0;
 
@@ -439,9 +352,6 @@ class _ScannerPageState extends State<ScannerPage> {
       case "snack_pack": widthCm = 15.0; heightCm = 20.0; depthCm = 5.0; densityGCm3 = 0.1; break;
       default: widthCm = 7.0; heightCm = 20.0; depthCm = 7.0; break;
     }
-
-    double depthScaleFactor = depthToItemCm / 30.0;
-    widthCm *= depthScaleFactor; heightCm *= depthScaleFactor; depthCm *= depthScaleFactor;
 
     double volumeCm3 = widthCm * heightCm * depthCm;
     double weightGrams = volumeCm3 * densityGCm3;
@@ -529,22 +439,37 @@ class _ScannerPageState extends State<ScannerPage> {
       XFile? finalImage;
       String currentDetectedClass = "";
 
-      // HYBRID APPROACH IMPLEMENTATION
       if (preSelectedImage != null) {
+        // --- MANUAL UPLOAD LOGIC ---
         _emitUpdate(5, "1. Image Upload", "Analyzing uploaded image...");
         finalImage = preSelectedImage;
         await Future.delayed(const Duration(milliseconds: 500));
         if (_isCancelled) throw Exception("cancelled_by_user");
 
-      } else {
-        _emitUpdate(5, "1. Hardware Override", "Freezing native stream for High-Res Capture...");
+        String? yoloResult = await _runYoloInference(finalImage.path);
+        if (yoloResult == null) {
+          throw Exception("YOLO could not classify item.");
+        }
+        currentDetectedClass = yoloResult;
+        _emitUpdate(20, "2. Vision Model", "Verified: $currentDetectedClass");
 
-        // 1. Temporarily hide YOLOView so it releases the Camera Hardware lock
+      } else {
+        // --- LIVE HYBRID LOGIC ---
+        _emitUpdate(5, "1. Live Detection", "Locking YOLO prediction...");
+
+        // Failsafe: Ensure YOLO actually saw something within the last 1.5 seconds!
+        if (_liveDetectedClass.isEmpty || _lastDetectionTime == null || DateTime.now().difference(_lastDetectionTime!).inMilliseconds > 1500) {
+          throw Exception("No clear object detected. Please aim at an object first.");
+        }
+
+        currentDetectedClass = _liveDetectedClass;
+        _emitUpdate(10, "1. Vision Model", "Verified from live stream: $currentDetectedClass (${(_liveDetectedConf * 100).toStringAsFixed(0)}%)");
+
+        _emitUpdate(20, "2. Hardware Override", "Freezing stream for High-Res Capture...");
         setState(() => _useNativeYoloView = false);
         await Future.delayed(const Duration(milliseconds: 400));
         if (_isCancelled) throw Exception("cancelled_by_user");
 
-        // 2. Initialize the standard CameraController for a 12MP shot
         final cameras = await availableCameras();
         _controller = CameraController(
           cameras.first,
@@ -555,38 +480,26 @@ class _ScannerPageState extends State<ScannerPage> {
         await _controller!.initialize();
         if (_isCancelled) throw Exception("cancelled_by_user");
 
-        _emitUpdate(10, "1. Image Capture", "Taking 12MP snapshot for OCR...");
+        _emitUpdate(30, "3. Image Capture", "Taking 12MP snapshot for OCR...");
         finalImage = await _controller!.takePicture();
 
-        // 3. Immediately free the camera again so AR or YOLOView can use it later
+        // Immediately free the camera again
         await _controller!.dispose();
         _controller = null;
       }
 
       if (_isCancelled) throw Exception("cancelled_by_user");
 
-      _emitUpdate(20, "2. Vision Model", "Analyzing spatial geometry...");
-      String? yoloResult = await _runYoloInference(finalImage.path);
-
-      if (yoloResult == null) {
-        throw Exception("YOLO could not classify item.");
-      }
-
-      currentDetectedClass = yoloResult;
-      _emitUpdate(40, "2. Vision Model", "Verified: $currentDetectedClass");
-
-      await _debugPause("Step 1 Complete", "Final YOLO26 Classification Selected: $currentDetectedClass");
+      await _debugPause("Detection Complete", "Final YOLO26 Classification: $currentDetectedClass");
       if (_isCancelled) throw Exception("cancelled_by_user");
 
       // STEP 2: OCR Data Extraction
-      _emitUpdate(50, "2. Data Extraction (OCR)", "Scanning packaging for weight & labels...");
+      _emitUpdate(50, "4. Data Extraction (OCR)", "Scanning packaging for weight & labels...");
       final InputImage inputImage = InputImage.fromFilePath(finalImage.path);
       final RecognizedText recognizedText = await _textRecognizer.processImage(inputImage);
       String ocrText = recognizedText.text.replaceAll('\n', ' ').toLowerCase();
 
-      // =========================================================================
-      // DYNAMIC OCR UPGRADE: Sort text physically and grab the top 5 largest blocks
-      // =========================================================================
+      // SPATIAL OCR SORTING
       List<TextBlock> sortedBlocks = recognizedText.blocks.toList();
       sortedBlocks.sort((a, b) {
         double areaA = a.boundingBox.width * a.boundingBox.height;
@@ -602,10 +515,8 @@ class _ScannerPageState extends State<ScannerPage> {
         }
       }
 
-      // Grab top 5 words (Usually Brand + Flavor + Style)
       String ocrSearchContext = prominentText.take(5).join(' ');
       String detectedBrand = prominentText.isNotEmpty ? prominentText.first.toUpperCase() : "Unknown";
-      // =========================================================================
 
       if (_isCancelled) throw Exception("cancelled_by_user");
 
@@ -632,9 +543,8 @@ class _ScannerPageState extends State<ScannerPage> {
 
       // STEP 2.5: OPEN FOOD FACTS CLOUD API FALLBACK
       if (!ocrWeightFound) {
-        _emitUpdate(58, "2. Cloud API Fallback", "Local OCR failed. Querying OpenFacts DB...");
+        _emitUpdate(58, "4. Cloud API Fallback", "Local OCR failed. Querying OpenFacts DB...");
 
-        // CRITICAL: Search only using OCR labels. Never append YOLO class if OCR is found!
         String searchQuery = ocrSearchContext.isNotEmpty
             ? ocrSearchContext
             : currentDetectedClass.replaceAll('_', ' ');
@@ -673,7 +583,7 @@ class _ScannerPageState extends State<ScannerPage> {
 
                   ocrWeightFound = true;
                   detectedBrand = (product.brands ?? detectedBrand).toUpperCase();
-                  _emitUpdate(62, "2. Cloud API (Success)", "Matched $detectedBrand: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
+                  _emitUpdate(62, "4. Cloud API (Success)", "Matched $detectedBrand: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
                   break;
                 }
               }
@@ -681,7 +591,7 @@ class _ScannerPageState extends State<ScannerPage> {
           }
         } catch (e) {
           debugPrint("OpenFoodFacts DB Fetch Error: $e");
-          _emitUpdate(62, "2. Cloud API", "Cloud server busy. Proceeding to AR.");
+          _emitUpdate(62, "4. Cloud API", "Cloud server busy. Proceeding volumetrics.");
         }
       }
 
@@ -690,24 +600,24 @@ class _ScannerPageState extends State<ScannerPage> {
       String weightDisplay = ocrWeightFound ? "${(detectedWeightKg * 1000).toStringAsFixed(0)}g" : "Not Found";
       String extText = "W: $weightDisplay | B: $detectedBrand";
 
-      _emitUpdate(65, "2. Data Extraction", extText);
-      await _debugPause("Step 2 Complete", "Data Extracted:\n$extText");
+      _emitUpdate(65, "4. Data Extraction", extText);
+      await _debugPause("Data Extracted", extText);
       if (_isCancelled) throw Exception("cancelled_by_user");
 
-      // STEP 3: Automated True Depth Failsafe
+      // STEP 3: Volumetric Failsafe (AR Removed)
       if (!ocrWeightFound) {
-        detectedWeightKg = await _estimateWeightViaAR(currentDetectedClass);
-        _emitUpdate(80, "3. True Depth (AR)", "Estimated mass scaled by distance: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
+        detectedWeightKg = await _estimateWeightVolumetrically(currentDetectedClass);
+        _emitUpdate(80, "5. Volumetric Scaling", "Estimated mass: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
       } else {
-        _emitUpdate(70, "3. True Depth (AR)", "Bypassing AR Laser: Exact weight found.");
+        _emitUpdate(70, "5. Volumetric Scaling", "Bypassing Volume Math: Exact weight found.");
         await Future.delayed(const Duration(milliseconds: 600));
       }
 
       if (_isCancelled) throw Exception("cancelled_by_user");
-      await _debugPause("Step 3 Complete", "Volumetric calculation complete.\nFinal Assigned Mass: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
+      await _debugPause("Volumetrics Complete", "Final Assigned Mass: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
 
       // STEP 4: AI Cross-Validation
-      _emitUpdate(85, "4. Multi-Modal Validation", "Matching YOLO vision with text context...");
+      _emitUpdate(85, "6. Multi-Modal Validation", "Matching YOLO vision with text context...");
       await Future.delayed(const Duration(milliseconds: 800));
 
       bool isContradiction = false;
@@ -724,19 +634,16 @@ class _ScannerPageState extends State<ScannerPage> {
       }
 
       if (isContradiction) {
-        _emitUpdate(90, "4. Multi-Modal Validation", "Contradiction found! $mismatchReason");
+        _emitUpdate(90, "6. Multi-Modal Validation", "Contradiction found! $mismatchReason");
         await Future.delayed(const Duration(milliseconds: 2000));
         throw Exception("Cross-validation failed. $mismatchReason Please re-scan.");
       }
 
-      _emitUpdate(90, "4. Multi-Modal Validation", "Data verified. No contradictions found.");
-      if (_isCancelled) throw Exception("cancelled_by_user");
-
-      await _debugPause("Step 4 Complete", "Multi-Modal Validation passed successfully.");
+      _emitUpdate(90, "6. Multi-Modal Validation", "Data verified. No contradictions found.");
       if (_isCancelled) throw Exception("cancelled_by_user");
 
       // STEP 5: GRU Carbon Estimation
-      _emitUpdate(95, "5. GRU Carbon Estimation", "Feeding validated sequence to RNN...");
+      _emitUpdate(95, "7. GRU Carbon Estimation", "Feeding validated sequence to RNN...");
 
       double? finalFootprint = await _estimateCarbonFootprint(currentDetectedClass, detectedWeightKg);
 
@@ -839,7 +746,7 @@ class _ScannerPageState extends State<ScannerPage> {
 
   @override
   void dispose() {
-    _isCancelled = true; // FIX D: Stop background threads from updating dead UI
+    _isCancelled = true;
     _pipelineController?.close();
     _controller?.dispose();
     _textRecognizer.close();
@@ -860,9 +767,49 @@ class _ScannerPageState extends State<ScannerPage> {
           Positioned.fill(
             child: _isInitialized && _yoloPlugin != null
                 ? (_useNativeYoloView
-            // When idle, show the fast native YOLOView for live bounding boxes
-                ? YoloView(yolo: _yoloPlugin!) // Adjust 'yolo' argument if package uses 'controller' etc.
-            // During capture, we show a sleek loading screen while CameraController takes the 12MP shot silently
+            // Native YOLOView handles its own live streaming and bounding boxes
+                ? YOLOView(
+              modelPath: '${Directory.systemTemp.path}/yolo.tflite',
+              task: YOLOTask.detect,
+              onResult: (results) {
+                if (results.isEmpty) return;
+
+                double bestConf = 0.0;
+                String bestLabel = "";
+
+                // Safely extract the best prediction without type errors
+                for (var res in results) {
+                  dynamic dynamicRes = res;
+
+                  double conf = 0.0;
+                  try { conf = dynamicRes.confidence?.toDouble() ?? 0.0; } catch (_) {}
+                  if (conf == 0.0) {
+                    try { conf = dynamicRes.score?.toDouble() ?? 0.0; } catch (_) {}
+                  }
+
+                  String label = "";
+                  try { label = dynamicRes.className?.toString() ?? ""; } catch (_) {}
+                  if (label.isEmpty) {
+                    try { label = dynamicRes.name?.toString() ?? ""; } catch (_) {}
+                  }
+                  if (label.isEmpty) {
+                    try { label = dynamicRes.label?.toString() ?? ""; } catch (_) {}
+                  }
+
+                  if (conf > bestConf && label.isNotEmpty) {
+                    bestConf = conf;
+                    bestLabel = label;
+                  }
+                }
+
+                if (bestConf > 0.15) {
+                  _liveDetectedClass = bestLabel;
+                  _liveDetectedConf = bestConf;
+                  _lastDetectionTime = DateTime.now();
+                }
+              },
+            )
+            // Loading screen while CameraController takes the 12MP shot silently
                 : const Center(child: CircularProgressIndicator(color: brandGreen)))
                 : const Center(child: CircularProgressIndicator(color: brandGreen)),
           ),

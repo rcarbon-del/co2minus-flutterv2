@@ -1,21 +1,32 @@
-# ML Kit Text Recognition
+
+-keep class io.flutter.app.** { *; }
+-keep class io.flutter.plugin.** { *; }
+-keep class io.flutter.util.** { *; }
+-keep class io.flutter.view.** { *; }
+-keep class io.flutter.** { *; }
+-keep class io.flutter.plugins.** { *; }
+
+-dontwarn com.google.android.play.core.**
+
+-keepattributes Signature
+-keepattributes *Annotation*
+
 -dontwarn com.google.mlkit.vision.text.**
 -keep class com.google.mlkit.vision.text.** { *; }
 
-# TensorFlow Lite
--dontwarn org.tensorflow.lite.gpu.**
--keep class org.tensorflow.lite.** { *; }
-
-# Google Play Services ML
 -keep class com.google.android.gms.internal.ml.** { *; }
 -dontwarn com.google.android.gms.internal.ml.**
 
-# Ignore missing optional ML Kit libraries
 -dontwarn com.google.mlkit.vision.text.chinese.**
 -dontwarn com.google.mlkit.vision.text.devanagari.**
 -dontwarn com.google.mlkit.vision.text.japanese.**
 -dontwarn com.google.mlkit.vision.text.korean.**
 
+-keep class org.tensorflow.lite.** { *; }
 -keep class org.tensorflow.** { *; }
 -keep class com.ultralytics.** { *; }
+-dontwarn org.tensorflow.lite.gpu.**
 -dontwarn org.tensorflow.**
+
+-dontwarn java.beans.**
+-dontwarn org.yaml.snakeyaml.**
