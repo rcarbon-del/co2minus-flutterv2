@@ -38,18 +38,26 @@ Future<Uint8List> prepareYoloImage(String path) async {
     decoded = img.copyRotate(decoded, angle: 90);
   }
 
-  // 3. TRUE LETTERBOXING
-  // Create a square canvas matching the longest side
-  int maxSize = decoded.width > decoded.height ? decoded.width : decoded.height;
-  img.Image squareImage = img.Image(width: maxSize, height: maxSize);
+  // 3. SCALE DOWN BEFORE PADDING (Fixes the Massive RAM/Freeze Bug)
+  // YOLO26 requires a 640x640 tensor. We scale the longest side down to 640 first!
+  int targetSize = 640;
+  double scale = targetSize / (decoded.width > decoded.height ? decoded.width : decoded.height);
+  int newWidth = (decoded.width * scale).toInt();
+  int newHeight = (decoded.height * scale).toInt();
+
+  img.Image resizedImage = img.copyResize(decoded, width: newWidth, height: newHeight);
+
+  // 4. TRUE LETTERBOXING
+  // Create the 640x640 square canvas
+  img.Image squareImage = img.Image(width: targetSize, height: targetSize);
 
   // Fill the empty space with neutral grey (YOLO standard padding: 114, 114, 114)
   img.fill(squareImage, color: img.ColorRgb8(114, 114, 114));
 
-  // Center the actual image inside the square
-  int xOffset = (maxSize - decoded.width) ~/ 2;
-  int yOffset = (maxSize - decoded.height) ~/ 2;
-  img.compositeImage(squareImage, decoded, dstX: xOffset, dstY: yOffset);
+  // Center the resized image inside the square
+  int xOffset = (targetSize - newWidth) ~/ 2;
+  int yOffset = (targetSize - newHeight) ~/ 2;
+  img.compositeImage(squareImage, resizedImage, dstX: xOffset, dstY: yOffset);
 
   // Compress slightly to speed up C++ parsing
   return img.encodeJpg(squareImage, quality: 85);
@@ -141,9 +149,12 @@ class _ScannerPageState extends State<ScannerPage> {
       }
 
       try {
-        final byteData = await rootBundle.load('assets/models/yolo.tflite');
         final file = File('${Directory.systemTemp.path}/yolo.tflite');
-        await file.writeAsBytes(byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes));
+        // FIX C: Only write the 10MB model file to disk if it doesn't exist OR is corrupted (0 bytes)
+        if (!file.existsSync() || file.lengthSync() == 0) {
+          final byteData = await rootBundle.load('assets/models/yolo.tflite');
+          await file.writeAsBytes(byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes));
+        }
 
         _yoloPlugin = YOLO(
           modelPath: file.path,
@@ -270,15 +281,21 @@ class _ScannerPageState extends State<ScannerPage> {
     }
   }
 
-  void _cancelPipeline() {
+  // FIX D: Improved Cancellation State Management
+  void _cancelPipeline({bool poppedBySystem = false}) {
     _isCancelled = true;
     if (_isDialogShowing) {
-      Navigator.pop(context);
       _isDialogShowing = false;
+      // If the system back button popped the dialog, we don't need to pop again.
+      if (!poppedBySystem && mounted) {
+        Navigator.pop(context);
+      }
     }
-    setState(() {
-      _isAnalyzing = false;
-    });
+    if (mounted) {
+      setState(() {
+        _isAnalyzing = false;
+      });
+    }
   }
 
   // --- YOLO26 ULTRALYTICS INFERENCE WITH BACKGROUND LETTERBOXING ---
@@ -288,6 +305,9 @@ class _ScannerPageState extends State<ScannerPage> {
     try {
       // Offload to background isolate to prevent UI freezing
       final Uint8List fixedBytes = await compute(prepareYoloImage, imagePath);
+
+      // FIX D: Stop pipeline if user canceled OR exited the page during heavy processing!
+      if (!mounted || _isCancelled) return null;
 
       final resultsMap = await _yoloPlugin!.predict(
         fixedBytes,
@@ -419,7 +439,7 @@ class _ScannerPageState extends State<ScannerPage> {
           updateStream: _pipelineController!.stream,
           initialLogs: _pipelineHistory,
           initialProgress: _currentPipelineProgress,
-          onCancel: _cancelPipeline,
+          onCancel: (fromSystem) => _cancelPipeline(poppedBySystem: fromSystem),
         ),
       );
     }
@@ -509,7 +529,7 @@ class _ScannerPageState extends State<ScannerPage> {
     setState(() {
       _isAnalyzing = true;
       _isDialogShowing = true;
-      _isCancelled = false;
+      _isCancelled = false; // Reset on start
     });
 
     _pipelineHistory.clear();
@@ -523,7 +543,7 @@ class _ScannerPageState extends State<ScannerPage> {
         updateStream: _pipelineController!.stream,
         initialLogs: _pipelineHistory,
         initialProgress: _currentPipelineProgress,
-        onCancel: _cancelPipeline,
+        onCancel: (fromSystem) => _cancelPipeline(poppedBySystem: fromSystem),
       ),
     );
 
@@ -837,6 +857,7 @@ class _ScannerPageState extends State<ScannerPage> {
 
   @override
   void dispose() {
+    _isCancelled = true; // FIX D: Prevent ghost threads from updating unmounted UI
     _pipelineController?.close();
     _controller?.dispose();
     _textRecognizer.close();
@@ -996,7 +1017,7 @@ class _ProcessingDialog extends StatefulWidget {
   final Stream<PipelineUpdate> updateStream;
   final List<PipelineUpdate> initialLogs;
   final int initialProgress;
-  final VoidCallback onCancel;
+  final Function(bool) onCancel; // FIX D: Pass boolean for system pop
 
   const _ProcessingDialog({
     required this.updateStream,
@@ -1034,135 +1055,143 @@ class _ProcessingDialogState extends State<_ProcessingDialog> {
     const Color brandNavy = Color(0xFF2D3E50);
     const Color brandGreen = Color(0xFFC8FFB0);
 
-    return Dialog(
-      backgroundColor: Colors.transparent,
-      insetPadding: const EdgeInsets.symmetric(horizontal: 24),
-      child: Container(
-        height: 520, // Increased height slightly to accommodate the new button
-        decoration: BoxDecoration(
-          color: Colors.white.withValues(alpha: 0.98),
-          borderRadius: BorderRadius.circular(32),
-        ),
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      "ANALYZING",
-                      style: TextStyle(
-                        color: brandNavy.withValues(alpha: 0.5),
-                        fontSize: 12,
-                        fontWeight: FontWeight.w800,
-                        letterSpacing: 1.5,
+    return PopScope(
+      canPop: true,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) {
+          widget.onCancel(true); // true = popped by system back button
+        }
+      },
+      child: Dialog(
+        backgroundColor: Colors.transparent,
+        insetPadding: const EdgeInsets.symmetric(horizontal: 24),
+        child: Container(
+          height: 520,
+          decoration: BoxDecoration(
+            color: Colors.white.withValues(alpha: 0.98),
+            borderRadius: BorderRadius.circular(32),
+          ),
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        "ANALYZING",
+                        style: TextStyle(
+                          color: brandNavy.withValues(alpha: 0.5),
+                          fontSize: 12,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 1.5,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      "$_currentProgress%",
-                      style: const TextStyle(
-                        color: brandNavy,
-                        fontSize: 56,
-                        height: 1.0,
-                        fontWeight: FontWeight.w900,
+                      const SizedBox(height: 4),
+                      Text(
+                        "$_currentProgress%",
+                        style: const TextStyle(
+                          color: brandNavy,
+                          fontSize: 56,
+                          height: 1.0,
+                          fontWeight: FontWeight.w900,
+                        ),
                       ),
-                    ),
-                  ],
-                ),
-                SizedBox(
-                  width: 40,
-                  height: 40,
-                  child: CircularProgressIndicator(
-                    value: _currentProgress / 100,
-                    color: brandGreen,
-                    backgroundColor: brandNavy.withValues(alpha: 0.1),
-                    strokeWidth: 6,
+                    ],
                   ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 24),
-            const Divider(height: 1),
-            const SizedBox(height: 16),
-            Expanded(
-              child: ListView.builder(
-                itemCount: _logs.length,
-                itemBuilder: (context, index) {
-                  final log = _logs[index];
-                  final bool isLatest = index == 0;
+                  SizedBox(
+                    width: 40,
+                    height: 40,
+                    child: CircularProgressIndicator(
+                      value: _currentProgress / 100,
+                      color: brandGreen,
+                      backgroundColor: brandNavy.withValues(alpha: 0.1),
+                      strokeWidth: 6,
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 24),
+              const Divider(height: 1),
+              const SizedBox(height: 16),
+              Expanded(
+                child: ListView.builder(
+                  itemCount: _logs.length,
+                  itemBuilder: (context, index) {
+                    final log = _logs[index];
+                    final bool isLatest = index == 0;
 
-                  return Padding(
-                    padding: const EdgeInsets.only(bottom: 16),
-                    child: Row(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Container(
-                          margin: const EdgeInsets.only(top: 4),
-                          width: 8,
-                          height: 8,
-                          decoration: BoxDecoration(
-                            color: isLatest ? brandGreen : brandNavy.withValues(alpha: 0.2),
-                            shape: BoxShape.circle,
+                    return Padding(
+                      padding: const EdgeInsets.only(bottom: 16),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Container(
+                            margin: const EdgeInsets.only(top: 4),
+                            width: 8,
+                            height: 8,
+                            decoration: BoxDecoration(
+                              color: isLatest ? brandGreen : brandNavy.withValues(alpha: 0.2),
+                              shape: BoxShape.circle,
+                            ),
                           ),
-                        ),
-                        const SizedBox(width: 12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                log.step,
-                                style: TextStyle(
-                                  color: isLatest ? brandNavy : brandNavy.withValues(alpha: 0.4),
-                                  fontWeight: FontWeight.w800,
-                                  fontSize: 13,
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  log.step,
+                                  style: TextStyle(
+                                    color: isLatest ? brandNavy : brandNavy.withValues(alpha: 0.4),
+                                    fontWeight: FontWeight.w800,
+                                    fontSize: 13,
+                                  ),
                                 ),
-                              ),
-                              const SizedBox(height: 4),
-                              Text(
-                                log.detail,
-                                style: TextStyle(
-                                  color: isLatest ? brandNavy.withValues(alpha: 0.8) : brandNavy.withValues(alpha: 0.3),
-                                  fontWeight: FontWeight.w600,
-                                  fontSize: 12,
-                                  height: 1.3,
+                                const SizedBox(height: 4),
+                                Text(
+                                  log.detail,
+                                  style: TextStyle(
+                                    color: isLatest ? brandNavy.withValues(alpha: 0.8) : brandNavy.withValues(alpha: 0.3),
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: 12,
+                                    height: 1.3,
+                                  ),
                                 ),
-                              ),
-                            ],
+                              ],
+                            ),
                           ),
-                        ),
-                      ],
-                    ),
-                  );
-                },
-              ),
-            ),
-            const SizedBox(height: 16),
-            SizedBox(
-              width: double.infinity,
-              child: TextButton(
-                onPressed: widget.onCancel,
-                style: TextButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(vertical: 14),
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-                  backgroundColor: Colors.red.withValues(alpha: 0.1),
+                        ],
+                      ),
+                    );
+                  },
                 ),
-                child: const Text(
-                  "CANCEL PROCESS",
-                  style: TextStyle(
-                    color: Colors.red,
-                    fontWeight: FontWeight.w900,
-                    letterSpacing: 1.2,
+              ),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: TextButton(
+                  onPressed: () => widget.onCancel(false), // false = popped via cancel button
+                  style: TextButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                    backgroundColor: Colors.red.withValues(alpha: 0.1),
+                  ),
+                  child: const Text(
+                    "CANCEL PROCESS",
+                    style: TextStyle(
+                      color: Colors.red,
+                      fontWeight: FontWeight.w900,
+                      letterSpacing: 1.2,
+                    ),
                   ),
                 ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );
