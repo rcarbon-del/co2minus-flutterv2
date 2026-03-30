@@ -4,10 +4,14 @@ import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.view.View
+import android.widget.FrameLayout
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
-import com.google.ar.sceneform.ux.ArFragment
+import androidx.fragment.app.Fragment
+import androidx.fragment.app.FragmentManager
 import com.google.ar.core.TrackingState
+import com.google.ar.sceneform.ux.ArFragment
 
 class ArDepthActivity : AppCompatActivity() {
     private var depthFound = false
@@ -15,27 +19,54 @@ class ArDepthActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // 1. Create the AR Fragment
-        val arFragment = ArFragment()
-        supportFragmentManager.beginTransaction()
-            .replace(android.R.id.content, arFragment)
-            .commit()
-        supportFragmentManager.executePendingTransactions()
+        // 1. Create a dedicated container for the AR Fragment
+        val container = FrameLayout(this)
+        container.id = View.generateViewId()
+        setContentView(container)
 
-        // (The planeDiscoveryController lines were removed from here!)
+        val arFragment = ArFragment()
+
+        // 2. CRITICAL FIX: Wait for the fragment to actually build its UI before accessing it!
+        supportFragmentManager.registerFragmentLifecycleCallbacks(object : FragmentManager.FragmentLifecycleCallbacks() {
+            override fun onFragmentViewCreated(fm: FragmentManager, f: Fragment, v: View, savedInstanceState: Bundle?) {
+                super.onFragmentViewCreated(fm, f, v, savedInstanceState)
+                if (f === arFragment) {
+                    setupArUpdateListener(f as ArFragment)
+                }
+            }
+        }, false)
+
+        supportFragmentManager.beginTransaction()
+            .replace(container.id, arFragment)
+            .commit()
 
         Toast.makeText(this, "Measuring True Depth...", Toast.LENGTH_LONG).show()
 
-        // 2. AUTOMATED RAYCAST (HitTest) - Fires 60 times a second!
-        arFragment.arSceneView.scene.addOnUpdateListener {
+        // 3. Failsafe Timeout (10 seconds)
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (!depthFound) {
+                depthFound = true
+                val resultIntent = Intent()
+                resultIntent.putExtra("DEPTH_CM", 30.0) // Fallback baseline distance
+                setResult(RESULT_OK, resultIntent)
+                finish()
+            }
+        }, 10000)
+    }
+
+    private fun setupArUpdateListener(arFragment: ArFragment) {
+        val sceneView = arFragment.arSceneView ?: return
+
+        // 4. AUTOMATED RAYCAST (HitTest) - Fires 60 times a second!
+        sceneView.scene.addOnUpdateListener {
             if (depthFound) return@addOnUpdateListener
 
-            val frame = arFragment.arSceneView.arFrame ?: return@addOnUpdateListener
+            val frame = sceneView.arFrame ?: return@addOnUpdateListener
             if (frame.camera.trackingState != TrackingState.TRACKING) return@addOnUpdateListener
 
             // Get exact center of screen
-            val centerX = arFragment.arSceneView.width / 2f
-            val centerY = arFragment.arSceneView.height / 2f
+            val centerX = sceneView.width / 2f
+            val centerY = sceneView.height / 2f
 
             // Fire laser
             val hitResults = frame.hitTest(centerX, centerY)
@@ -54,16 +85,5 @@ class ArDepthActivity : AppCompatActivity() {
                 }
             }
         }
-
-        // 3. Failsafe Timeout (10 seconds)
-        Handler(Looper.getMainLooper()).postDelayed({
-            if (!depthFound) {
-                depthFound = true
-                val resultIntent = Intent()
-                resultIntent.putExtra("DEPTH_CM", 30.0) // Fallback baseline distance
-                setResult(RESULT_OK, resultIntent)
-                finish()
-            }
-        }, 10000)
     }
 }
