@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -18,6 +19,8 @@ import 'package:torch_light/torch_light.dart'; // Handles native hardware flash 
 import 'package:flutter_litert/flutter_litert.dart';
 import 'package:image/image.dart' as img;
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
+import 'package:ultralytics_yolo/yolo.dart';
+import 'package:ultralytics_yolo/yolo_view.dart';
 
 import 'user_provider.dart';
 
@@ -267,8 +270,7 @@ class _ScannerPageState extends State<ScannerPage> {
                 }
 
                 if (conf >= requiredThreshold && label.isNotEmpty) {
-                  // 2. AREA-WEIGHTED SCORING (The "Subject" Filter)
-                  // Grabs the size of the bounding box to calculate surface area
+                  // 2. AREA-WEIGHTED SCORING + CENTER BIAS (The "Subject" Filter)
                   double l = (item['left'] ?? item['xMin'] ?? 0.0).toDouble();
                   double t = (item['top'] ?? item['yMin'] ?? 0.0).toDouble();
                   double r = (item['right'] ?? item['xMax'] ?? 0.0).toDouble();
@@ -281,9 +283,32 @@ class _ScannerPageState extends State<ScannerPage> {
                   // Failsafe: if plugin didn't provide coordinates, default to 1.0 (pure confidence)
                   if (boxArea <= 0.0) boxArea = 1.0;
 
-                  // Multiply confidence by Area. This mathematically guarantees that a
-                  // huge, prominent 35% Coke can will instantly outscore a tiny 90% background bottle.
-                  double weightedScore = conf * boxArea;
+                  // Calculate how close the object is to the center of the image
+                  double boxCenterX = l + (w / 2);
+                  double boxCenterY = t + (h / 2);
+
+                  double frameWidth = 640.0; // The prepareYoloImage scales to 640x640
+                  double frameHeight = 640.0;
+
+                  // Auto-detect if coordinates are normalized [0.0 - 1.0]
+                  if (w <= 1.0 && h <= 1.0 && r <= 1.0 && b <= 1.0) {
+                    frameWidth = 1.0;
+                    frameHeight = 1.0;
+                  }
+
+                  double frameCenterX = frameWidth / 2;
+                  double frameCenterY = frameHeight / 2;
+
+                  // Distance from center (0.0 to 1.0, where 1.0 is dead center)
+                  double dx = (boxCenterX - frameCenterX).abs() / frameWidth;
+                  double dy = (boxCenterY - frameCenterY).abs() / frameHeight;
+                  double centerProximity = 1.0 - (dx + dy);
+                  if (centerProximity < 0.1) centerProximity = 0.1; // Floor to prevent zeroing out
+
+                  // Multiply: Confidence x Area x Center Proximity
+                  // This mathematically guarantees that a huge, centered 35% object
+                  // will instantly outscore a tiny 90% background object in the corner.
+                  double weightedScore = conf * boxArea * centerProximity;
 
                   if (weightedScore > bestWeightedScore) {
                     bestWeightedScore = weightedScore;
@@ -385,7 +410,7 @@ class _ScannerPageState extends State<ScannerPage> {
 
     if (preSelectedImage != null) {
       setState(() {
-        _capturedImagePath = preSelectedImage!.path; // Added '!' to fix null-safety error
+        _capturedImagePath = preSelectedImage!.path; // Freeze UI immediately on selected image
       });
     }
 
@@ -413,7 +438,7 @@ class _ScannerPageState extends State<ScannerPage> {
       if (preSelectedImage != null) {
         // --- MANUAL UPLOAD LOGIC ---
         _emitUpdate(5, "1. Image Upload", "Safely allocating memory...");
-        finalImagePath = preSelectedImage.path; // Added '!' here too just in case
+        finalImagePath = preSelectedImage!.path;
 
         // Wait 2500ms for YOLOView to fully unmount before running static YOLO prediction
         // This prevents the SIGSEGV crash caused by GPU delegate memory conflicts!
@@ -956,9 +981,9 @@ class _ScannerPageState extends State<ScannerPage> {
               onResult: (results) {
 
                 // 1. FRAME THROTTLING (The Thermal Fix)
-                // Limit Dart-side processing to ~6 FPS to prevent CPU overheating on budget phones.
+                // Limit Dart-side processing to ~15 FPS to prevent CPU overheating on budget phones while staying snappy.
                 int currentTime = DateTime.now().millisecondsSinceEpoch;
-                if (currentTime - _lastYoloFrameTime < 150) return;
+                if (currentTime - _lastYoloFrameTime < 66) return;
                 _lastYoloFrameTime = currentTime;
 
                 if (results.isEmpty) {
@@ -978,6 +1003,7 @@ class _ScannerPageState extends State<ScannerPage> {
                   return;
                 }
 
+                double bestWeightedScore = 0.0;
                 double bestConf = 0.0;
                 String bestLabel = "";
 
@@ -1000,8 +1026,64 @@ class _ScannerPageState extends State<ScannerPage> {
                     try { label = dynamicRes.label?.toString() ?? ""; } catch (_) {}
                   }
 
-                  if (conf > bestConf && label.isNotEmpty) {
-                    bestConf = conf;
+                  // --- AREA-WEIGHTED SCORING & CENTER BIAS (Subject Filter) ---
+                  double l = 0.0; double t = 0.0; double r = 0.0; double b = 0.0;
+                  double w = 0.0; double h = 0.0;
+
+                  try {
+                    var rect = dynamicRes.rect;
+                    if (rect != null) {
+                      l = rect.left?.toDouble() ?? 0.0;
+                      t = rect.top?.toDouble() ?? 0.0;
+                      r = rect.right?.toDouble() ?? 0.0;
+                      b = rect.bottom?.toDouble() ?? 0.0;
+                      w = rect.width?.toDouble() ?? (r - l).abs();
+                      h = rect.height?.toDouble() ?? (b - t).abs();
+                    } else {
+                      l = dynamicRes.left?.toDouble() ?? dynamicRes.xMin?.toDouble() ?? 0.0;
+                      r = dynamicRes.right?.toDouble() ?? dynamicRes.xMax?.toDouble() ?? 0.0;
+                      t = dynamicRes.top?.toDouble() ?? dynamicRes.yMin?.toDouble() ?? 0.0;
+                      b = dynamicRes.bottom?.toDouble() ?? dynamicRes.yMax?.toDouble() ?? 0.0;
+                      w = dynamicRes.width?.toDouble() ?? (r - l).abs();
+                      h = dynamicRes.height?.toDouble() ?? (b - t).abs();
+                    }
+                  } catch (_) {}
+
+                  double boxArea = w * h;
+                  if (boxArea <= 0.0) boxArea = 1.0; // Fallback to raw confidence
+
+                  // Calculate how close the object is to the center of the camera frame
+                  double boxCenterX = l + (w / 2);
+                  double boxCenterY = t + (h / 2);
+
+                  double frameWidth = MediaQuery.of(context).size.width;
+                  double frameHeight = MediaQuery.of(context).size.height;
+
+                  // Auto-detect if coordinates are normalized [0.0 - 1.0] or tensor (e.g. 640x640)
+                  if (w <= 1.0 && h <= 1.0 && r <= 1.0 && b <= 1.0) {
+                    frameWidth = 1.0;
+                    frameHeight = 1.0;
+                  } else if (r > frameWidth || b > frameHeight) {
+                    frameWidth = 640.0; // YOLO standard inference size fallback
+                    frameHeight = 640.0;
+                  }
+
+                  double frameCenterX = frameWidth / 2;
+                  double frameCenterY = frameHeight / 2;
+
+                  // Distance from center (0.0 to 1.0, where 1.0 is dead center)
+                  double dx = (boxCenterX - frameCenterX).abs() / frameWidth;
+                  double dy = (boxCenterY - frameCenterY).abs() / frameHeight;
+                  double centerProximity = 1.0 - (dx + dy);
+                  if (centerProximity < 0.1) centerProximity = 0.1; // Floor to prevent zeroing out
+
+                  // Multiply: Confidence x Area x Center Proximity
+                  // This forces YOLO to target the largest object closest to the crosshair!
+                  double weightedScore = conf * boxArea * centerProximity;
+
+                  if (weightedScore > bestWeightedScore && label.isNotEmpty) {
+                    bestWeightedScore = weightedScore;
+                    bestConf = conf; // Keep raw confidence for dynamic thresholds
                     bestLabel = label;
                   }
                 }
@@ -1042,8 +1124,8 @@ class _ScannerPageState extends State<ScannerPage> {
                     });
                   }
 
-                  // Require exactly 4 consecutive frames (approx. ~0.6s at 6fps) of the SAME object
-                  if (_streakCount >= 4) {
+                  // Require exactly 3 consecutive frames (approx. ~0.2s at 15fps) of the SAME object
+                  if (_streakCount >= 3) {
                     _liveDetectedClass = _currentStreakClass;
                     _liveDetectedConf = bestConf;
                     _lastDetectionTime = DateTime.now();
@@ -1086,12 +1168,12 @@ class _ScannerPageState extends State<ScannerPage> {
                   duration: const Duration(milliseconds: 200),
                   padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
                   decoration: BoxDecoration(
-                      color: _streakCount >= 4
+                      color: _streakCount >= 3
                           ? brandGreen.withValues(alpha: 0.95)
                           : brandNavy.withValues(alpha: 0.85),
                       borderRadius: BorderRadius.circular(30),
                       border: Border.all(
-                        color: _streakCount >= 4 ? brandNavy : Colors.transparent,
+                        color: _streakCount >= 3 ? brandNavy : Colors.transparent,
                         width: 2,
                       ),
                       boxShadow: [
@@ -1106,15 +1188,15 @@ class _ScannerPageState extends State<ScannerPage> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Icon(
-                        _streakCount >= 4 ? Icons.check_circle_rounded : Icons.sync_rounded,
-                        color: _streakCount >= 4 ? brandNavy : Colors.white,
+                        _streakCount >= 3 ? Icons.check_circle_rounded : Icons.sync_rounded,
+                        color: _streakCount >= 3 ? brandNavy : Colors.white,
                         size: 16,
                       ),
                       const SizedBox(width: 8),
                       Text(
                         _currentStreakClass.replaceAll('_', ' ').toUpperCase(),
                         style: TextStyle(
-                          color: _streakCount >= 4 ? brandNavy : Colors.white,
+                          color: _streakCount >= 3 ? brandNavy : Colors.white,
                           fontWeight: FontWeight.w900,
                           fontSize: 14,
                           letterSpacing: 0.5,
@@ -1124,13 +1206,13 @@ class _ScannerPageState extends State<ScannerPage> {
                       Container(
                         padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                         decoration: BoxDecoration(
-                          color: _streakCount >= 4 ? brandNavy.withValues(alpha: 0.1) : brandGreen.withValues(alpha: 0.2),
+                          color: _streakCount >= 3 ? brandNavy.withValues(alpha: 0.1) : brandGreen.withValues(alpha: 0.2),
                           borderRadius: BorderRadius.circular(10),
                         ),
                         child: Text(
                           "${(_currentStreakConf * 100).toStringAsFixed(0)}%",
                           style: TextStyle(
-                            color: _streakCount >= 4 ? brandNavy : brandGreen,
+                            color: _streakCount >= 3 ? brandNavy : brandGreen,
                             fontWeight: FontWeight.w900,
                             fontSize: 12,
                           ),
