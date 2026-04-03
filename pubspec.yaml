@@ -30,6 +30,8 @@ dependencies:
   http: ^1.6.0
   openfoodfacts: ^3.30.2
   image_picker: ^1.2.1
+  flutter_litert: ^2.0.10
+  path_provider: ^2.1.5
 
 dev_dependencies:
   flutter_test:
@@ -51,7 +53,7 @@ flutter:
     - assets/images/logo.png
     - assets/flutter_lca_database.json
     - assets/flutter_scaler_config.json
-    - assets/models/yolo.tflite
+    - assets/models/yolo_f16.tflite
     - assets/models/gru.tflite
   fonts:
     - family: MiSans

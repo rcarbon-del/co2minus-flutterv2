@@ -15,8 +15,8 @@ import 'package:image_picker/image_picker.dart';
 import 'package:openfoodfacts/openfoodfacts.dart';
 
 // Google LiteRT (Formerly TensorFlow Lite Flutter)
-import 'package:litert/litert.dart';
-
+import 'package:flutter_litert/flutter_litert.dart';
+import 'package:image/image.dart' as img;
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
 import 'package:ultralytics_yolo/yolo.dart';
 import 'package:ultralytics_yolo/yolo_view.dart';
@@ -31,11 +31,10 @@ Future<Uint8List> prepareYoloImage(String path) async {
   img.Image? decoded = img.decodeImage(bytes);
   if (decoded == null) return bytes;
 
+  // Fix EXIF orientation (e.g. if the image was taken upside down)
   decoded = img.bakeOrientation(decoded);
-  if (decoded.width > decoded.height) {
-    decoded = img.copyRotate(decoded, angle: 90);
-  }
 
+  // Scale down to max 640px to match YOLO format and save memory
   int targetSize = 640;
   double scale = targetSize / (decoded.width > decoded.height ? decoded.width : decoded.height);
   int newWidth = (decoded.width * scale).toInt();
@@ -43,6 +42,7 @@ Future<Uint8List> prepareYoloImage(String path) async {
 
   img.Image resizedImage = img.copyResize(decoded, width: newWidth, height: newHeight);
 
+  // Apply letterboxing (gray padding) to make it exactly 640x640
   img.Image squareImage = img.Image(width: targetSize, height: targetSize);
   img.fill(squareImage, color: img.ColorRgb8(114, 114, 114));
 
@@ -50,7 +50,7 @@ Future<Uint8List> prepareYoloImage(String path) async {
   int yOffset = (targetSize - newHeight) ~/ 2;
   img.compositeImage(squareImage, resizedImage, dstX: xOffset, dstY: yOffset);
 
-  return img.encodeJpg(squareImage, quality: 85);
+  return img.encodeJpg(squareImage, quality: 90);
 }
 // =========================================================================
 
@@ -74,7 +74,8 @@ class _ScannerPageState extends State<ScannerPage> {
   bool _isInitialized = false;
 
   // State for Hybrid Approach
-  bool _useNativeYoloView = true;
+  bool _useNativeYoloView = false; // Start false to prevent camera running behind startup dialogs!
+  String? _capturedImagePath; // Stores the frozen frame for the background
   String _liveDetectedClass = "";
   double _liveDetectedConf = 0.0;
   DateTime? _lastDetectionTime;
@@ -86,13 +87,16 @@ class _ScannerPageState extends State<ScannerPage> {
   Interpreter? _gruInterpreter;
   Map<String, dynamic>? _lcaDatabase;
   Map<String, dynamic>? _scalerConfig;
-  YOLO? _yoloPlugin;
+  YOLO? _yoloPlugin; // Used purely for static image uploads
 
   String _diagnosticMessage = "Initializing systems...";
 
   bool _isDialogShowing = false;
   bool _isAnalyzing = false;
+
+  // UI and Logic State variables
   String _detectedClass = "";
+  String _yoloCategory = "";
   double _carbonFootprint = 0.0;
 
   StreamController<PipelineUpdate>? _pipelineController;
@@ -134,18 +138,30 @@ class _ScannerPageState extends State<ScannerPage> {
       }
 
       try {
-        final file = File('${Directory.systemTemp.path}/yolo.tflite');
-        if (!file.existsSync() || file.lengthSync() == 0) {
-          final byteData = await rootBundle.load('assets/models/yolo.tflite');
-          await file.writeAsBytes(byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes));
+        // FIX FOR SIGSEGV CRASH:
+        // We create TWO separate files. One for the YOLOView live camera stream,
+        // and one for the static _yoloPlugin. This prevents them from fighting
+        // over the same memory-mapped TFLite file and crashing the GPU delegate.
+        final liveFile = File('${Directory.systemTemp.path}/yolo_f16_live.tflite');
+        final staticFile = File('${Directory.systemTemp.path}/yolo_f16_static.tflite');
+
+        if (!liveFile.existsSync() || liveFile.lengthSync() == 0) {
+          final byteData = await rootBundle.load('assets/models/yolo_f16.tflite');
+          await liveFile.writeAsBytes(byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes));
         }
 
+        if (!staticFile.existsSync() || staticFile.lengthSync() == 0) {
+          final byteData = await rootBundle.load('assets/models/yolo_f16.tflite');
+          await staticFile.writeAsBytes(byteData.buffer.asUint8List(byteData.offsetInBytes, byteData.lengthInBytes));
+        }
+
+        // Initialize static plugin exclusively on the static file copy
         _yoloPlugin = YOLO(
-          modelPath: file.path,
+          modelPath: staticFile.path,
           task: YOLOTask.detect,
         );
         await _yoloPlugin!.loadModel();
-        diag += "✅ YOLO26 Vision Model\n";
+        diag += "✅ YOLO26 Vision Model (FP16)\n";
       } catch (e) {
         diag += "❌ YOLO26 Model Error: $e\n";
       }
@@ -182,12 +198,19 @@ class _ScannerPageState extends State<ScannerPage> {
     }
 
     if (mounted) {
-      _showDiagnosticDialog();
+      await _showDiagnosticDialog();
+    }
+
+    // Only start the camera feed AFTER the startup dialogs are fully closed
+    if (mounted) {
+      setState(() {
+        _useNativeYoloView = true;
+      });
     }
   }
 
-  void _showDiagnosticDialog() {
-    showDialog(
+  Future<void> _showDiagnosticDialog() {
+    return showDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (context) => Dialog(
@@ -250,13 +273,17 @@ class _ScannerPageState extends State<ScannerPage> {
     if (_isDialogShowing) {
       _isDialogShowing = false;
       if (!poppedBySystem && mounted) {
-        Navigator.pop(context);
+        Navigator.pop(context, 'system_transition');
       }
     }
     if (mounted) {
       setState(() {
-        _isAnalyzing = false;
         _useNativeYoloView = true; // Restore the live stream
+        _capturedImagePath = null; // Clear frozen frame
+      });
+      // Safety Cooldown: Keep buttons locked for 2.5s to prevent SIGSEGV from rapid unmounting!
+      Future.delayed(const Duration(milliseconds: 2500), () {
+        if (mounted) setState(() => _isAnalyzing = false);
       });
     }
   }
@@ -269,7 +296,9 @@ class _ScannerPageState extends State<ScannerPage> {
 
       final resultsMap = await _yoloPlugin!.predict(
         fixedBytes,
-        confidenceThreshold: 0.15,
+        // Using a more forgiving threshold for static image uploads
+        // since we don't have a 30FPS live stream to catch the perfect angle.
+        confidenceThreshold: 0.30,
       );
 
       if (resultsMap.isNotEmpty) {
@@ -418,11 +447,19 @@ class _ScannerPageState extends State<ScannerPage> {
       _isAnalyzing = true;
       _isDialogShowing = true;
       _isCancelled = false; // Reset on start
+      _useNativeYoloView = false; // IMMEDIATELY unmount and stop the live camera feed
     });
+
+    if (preSelectedImage != null) {
+      setState(() {
+        _capturedImagePath = preSelectedImage.path; // Freeze UI immediately on selected image
+      });
+    }
 
     _pipelineHistory.clear();
     _currentPipelineProgress = 0;
-    _pipelineController = StreamController<PipelineUpdate>();
+    // Broadcast stream so we can pause/recreate the dialog listening to it
+    _pipelineController = StreamController<PipelineUpdate>.broadcast();
 
     showDialog(
       context: context,
@@ -438,14 +475,19 @@ class _ScannerPageState extends State<ScannerPage> {
     try {
       XFile? finalImage;
       String currentDetectedClass = "";
+      String uiItemName = "";
 
       if (preSelectedImage != null) {
         // --- MANUAL UPLOAD LOGIC ---
-        _emitUpdate(5, "1. Image Upload", "Analyzing uploaded image...");
+        _emitUpdate(5, "1. Image Upload", "Safely allocating memory...");
         finalImage = preSelectedImage;
-        await Future.delayed(const Duration(milliseconds: 500));
+
+        // Wait 2500ms for YOLOView to fully unmount before running static YOLO prediction
+        // This prevents the SIGSEGV crash caused by GPU delegate memory conflicts!
+        await Future.delayed(const Duration(milliseconds: 2500));
         if (_isCancelled) throw Exception("cancelled_by_user");
 
+        _emitUpdate(10, "1. Image Upload", "Analyzing uploaded image...");
         String? yoloResult = await _runYoloInference(finalImage.path);
         if (yoloResult == null) {
           throw Exception("YOLO could not classify item.");
@@ -465,33 +507,46 @@ class _ScannerPageState extends State<ScannerPage> {
         currentDetectedClass = _liveDetectedClass;
         _emitUpdate(10, "1. Vision Model", "Verified from live stream: $currentDetectedClass (${(_liveDetectedConf * 100).toStringAsFixed(0)}%)");
 
-        _emitUpdate(20, "2. Hardware Override", "Freezing stream for High-Res Capture...");
-        setState(() => _useNativeYoloView = false);
-        await Future.delayed(const Duration(milliseconds: 400));
+        _emitUpdate(20, "2. Hardware Override", "Releasing native camera feed...");
+
+        // CRITICAL FIX: Wait to ensure YOLOView hardware and native TFLite thread
+        // are completely released by the OS before starting CameraController.
+        // The logs showed inference taking ~2000ms. 2500ms safely clears the pipeline.
+        await Future.delayed(const Duration(milliseconds: 2500));
         if (_isCancelled) throw Exception("cancelled_by_user");
 
-        final cameras = await availableCameras();
-        _controller = CameraController(
-          cameras.first,
-          ResolutionPreset.max, // Perfect OCR clarity
-          enableAudio: false,
-          imageFormatGroup: ImageFormatGroup.nv21,
-        );
-        await _controller!.initialize();
-        if (_isCancelled) throw Exception("cancelled_by_user");
+        // Guarantee camera is released by wrapping in try/finally
+        try {
+          final cameras = await availableCameras();
+          _controller = CameraController(
+            cameras.first,
+            ResolutionPreset.max, // Perfect OCR clarity
+            enableAudio: false,
+            imageFormatGroup: ImageFormatGroup.nv21,
+          );
+          await _controller!.initialize();
+          if (_isCancelled) throw Exception("cancelled_by_user");
 
-        _emitUpdate(30, "3. Image Capture", "Taking 12MP snapshot for OCR...");
-        finalImage = await _controller!.takePicture();
+          _emitUpdate(30, "3. Image Capture", "Taking 12MP snapshot for OCR...");
+          finalImage = await _controller!.takePicture();
 
-        // Immediately free the camera again
-        await _controller!.dispose();
-        _controller = null;
+          // Freeze the captured image beautifully in the background
+          if (mounted) {
+            setState(() {
+              _capturedImagePath = finalImage!.path;
+            });
+          }
+        } finally {
+          // Immediately free the camera hardware no matter what happens
+          await _controller?.dispose();
+          _controller = null;
+        }
       }
 
       if (_isCancelled) throw Exception("cancelled_by_user");
 
-      await _debugPause("Detection Complete", "Final YOLO26 Classification: $currentDetectedClass");
-      if (_isCancelled) throw Exception("cancelled_by_user");
+      // Default to YOLO Class Name for UI unless OFF provides a better one
+      uiItemName = currentDetectedClass.replaceAll('_', ' ').toUpperCase();
 
       // STEP 2: OCR Data Extraction
       _emitUpdate(50, "4. Data Extraction (OCR)", "Scanning packaging for weight & labels...");
@@ -516,7 +571,7 @@ class _ScannerPageState extends State<ScannerPage> {
       }
 
       String ocrSearchContext = prominentText.take(5).join(' ');
-      String detectedBrand = prominentText.isNotEmpty ? prominentText.first.toUpperCase() : "Unknown";
+      String detectedBrand = prominentText.isNotEmpty ? prominentText.first.toUpperCase() : "";
 
       if (_isCancelled) throw Exception("cancelled_by_user");
 
@@ -541,58 +596,152 @@ class _ScannerPageState extends State<ScannerPage> {
         }
       }
 
-      // STEP 2.5: OPEN FOOD FACTS CLOUD API FALLBACK
-      if (!ocrWeightFound) {
-        _emitUpdate(58, "4. Cloud API Fallback", "Local OCR failed. Querying OpenFacts DB...");
+      // =======================================================================
+      // STEP 2.1: OCR Verification Dialog
+      // =======================================================================
+      _emitUpdate(55, "4. Verification", "Awaiting user verification of OCR data...");
+      await Future.delayed(const Duration(milliseconds: 300));
 
-        String searchQuery = ocrSearchContext.isNotEmpty
-            ? ocrSearchContext
-            : currentDetectedClass.replaceAll('_', ' ');
+      if (_isDialogShowing) {
+        Navigator.pop(context, 'system_transition'); // Passing system_transition prevents onCancel bug
+        _isDialogShowing = false;
+      }
 
-        try {
-          ProductSearchQueryConfiguration configuration = ProductSearchQueryConfiguration(
-            parametersList: <Parameter>[
-              SearchTerms(terms: [searchQuery]),
-            ],
-            language: OpenFoodFactsLanguage.ENGLISH,
-            fields: [ProductField.QUANTITY, ProductField.BRANDS],
-            version: ProductQueryVersion.v3,
+      final verificationResult = await showDialog<Map<String, dynamic>>(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => _OcrVerificationDialog(
+          imagePath: finalImage!.path,
+          textBlocks: sortedBlocks,
+          initialQuery: ocrSearchContext,
+          initialWeight: detectedWeightKg,
+          weightFound: ocrWeightFound,
+        ),
+      );
+
+      if (verificationResult == null) {
+        throw Exception("cancelled_by_user");
+      }
+
+      // Update state with user-verified input
+      ocrSearchContext = verificationResult['query'];
+      detectedWeightKg = verificationResult['weight'];
+      ocrWeightFound = verificationResult['weightFound'];
+      detectedBrand = ocrSearchContext.isNotEmpty ? ocrSearchContext.split(' ').first.toUpperCase() : "Unknown";
+
+      // Re-open processing dialog
+      _isDialogShowing = true;
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (context) => _ProcessingDialog(
+          updateStream: _pipelineController!.stream,
+          initialLogs: _pipelineHistory,
+          initialProgress: _currentPipelineProgress,
+          onCancel: (fromSystem) => _cancelPipeline(poppedBySystem: fromSystem),
+        ),
+      );
+
+      _emitUpdate(56, "4. Verification", "Data verified. Query: $ocrSearchContext");
+      if (_isCancelled) throw Exception("cancelled_by_user");
+
+
+      // =======================================================================
+      // STEP 2.5: OPEN FOOD FACTS CLOUD API
+      // =======================================================================
+      _emitUpdate(58, "4. OpenFoodFacts Search", "Querying DB for precise product description...");
+
+      String searchQuery = ocrSearchContext.isNotEmpty
+          ? ocrSearchContext
+          : currentDetectedClass.replaceAll('_', ' ');
+
+      try {
+        ProductSearchQueryConfiguration configuration = ProductSearchQueryConfiguration(
+          parametersList: <Parameter>[
+            SearchTerms(terms: [searchQuery]),
+            PageSize(size: 6), // Only grab max 6 items so the request doesn't freeze!
+          ],
+          language: OpenFoodFactsLanguage.ENGLISH,
+          version: ProductQueryVersion.v3,
+        );
+
+        // Added a 10-second timeout to prevent permanent freezing
+        SearchResult result = await OpenFoodAPIClient.searchProducts(
+          null,
+          configuration,
+        ).timeout(const Duration(seconds: 10));
+
+        if (result.products != null && result.products!.isNotEmpty) {
+          // Pause processing dialog to show product selection
+          if (_isDialogShowing) {
+            Navigator.pop(context, 'system_transition');
+            _isDialogShowing = false;
+          }
+
+          // Request dynamic result (can be 'cancel', 'skip', or a Product)
+          final dialogResult = await showDialog<dynamic>(
+            context: context,
+            barrierDismissible: false,
+            builder: (context) => _ProductSelectionDialog(products: result.products!),
           );
 
-          SearchResult result = await OpenFoodAPIClient.searchProducts(
-            null,
-            configuration,
+          if (dialogResult == null || dialogResult == 'cancel') {
+            throw Exception("cancelled_by_user");
+          }
+
+          // Resume processing dialog
+          _isDialogShowing = true;
+          showDialog(
+            context: context,
+            barrierDismissible: false,
+            builder: (context) => _ProcessingDialog(
+              updateStream: _pipelineController!.stream,
+              initialLogs: _pipelineHistory,
+              initialProgress: _currentPipelineProgress,
+              onCancel: (fromSystem) => _cancelPipeline(poppedBySystem: fromSystem),
+            ),
           );
 
-          if (result.products != null && result.products!.isNotEmpty) {
-            for (var product in result.products!) {
-              if (product.quantity != null && product.quantity!.isNotEmpty) {
-                RegExp regex = RegExp(r'(\d+(?:\.\d+)?)\s*(kg|g|ml|l|cl)', caseSensitive: false);
-                var m = regex.firstMatch(product.quantity!);
+          if (dialogResult is Product) {
+            final selectedProduct = dialogResult;
+            // 1. Capture the beautiful description/product name for the Success UI
+            if (selectedProduct.productName != null && selectedProduct.productName!.isNotEmpty) {
+              uiItemName = selectedProduct.productName!;
+            }
 
-                if (m != null) {
-                  double val = double.parse(m.group(1)!);
-                  String unit = m.group(2)!.toLowerCase();
+            // 2. Capture the validated brand
+            detectedBrand = (selectedProduct.brands ?? detectedBrand).toUpperCase();
 
-                  if (unit == 'g' || unit == 'ml' || unit == 'cl') {
-                    if (unit == 'cl') val *= 10;
-                    detectedWeightKg = val / 1000.0;
-                  } else {
-                    detectedWeightKg = val;
-                  }
+            // 3. Extract the perfect weight if available
+            if (selectedProduct.quantity != null && selectedProduct.quantity!.isNotEmpty) {
+              RegExp regex = RegExp(r'(\d+(?:\.\d+)?)\s*(kg|g|ml|l|cl)', caseSensitive: false);
+              var m = regex.firstMatch(selectedProduct.quantity!);
 
-                  ocrWeightFound = true;
-                  detectedBrand = (product.brands ?? detectedBrand).toUpperCase();
-                  _emitUpdate(62, "4. Cloud API (Success)", "Matched $detectedBrand: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
-                  break;
+              if (m != null) {
+                double val = double.parse(m.group(1)!);
+                String unit = m.group(2)!.toLowerCase();
+
+                if (unit == 'g' || unit == 'ml' || unit == 'cl') {
+                  if (unit == 'cl') val *= 10;
+                  detectedWeightKg = val / 1000.0;
+                } else {
+                  detectedWeightKg = val;
                 }
+
+                ocrWeightFound = true;
               }
             }
+
+            _emitUpdate(62, "4. Cloud API (Success)", "Matched $detectedBrand: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
+          } else if (dialogResult == 'skip') {
+            _emitUpdate(62, "4. Cloud API", "User skipped. Proceeding with local OCR data.");
           }
-        } catch (e) {
-          debugPrint("OpenFoodFacts DB Fetch Error: $e");
-          _emitUpdate(62, "4. Cloud API", "Cloud server busy. Proceeding volumetrics.");
+        } else {
+          _emitUpdate(62, "4. Cloud API", "No exact matches found. Using local data.");
         }
+      } catch (e) {
+        debugPrint("OpenFoodFacts DB Fetch Error: $e");
+        _emitUpdate(62, "4. Cloud API", "Cloud server busy. Proceeding with local data.");
       }
 
       if (_isCancelled) throw Exception("cancelled_by_user");
@@ -645,6 +794,7 @@ class _ScannerPageState extends State<ScannerPage> {
       // STEP 5: GRU Carbon Estimation
       _emitUpdate(95, "7. GRU Carbon Estimation", "Feeding validated sequence to RNN...");
 
+      // Model uses YOLO class exclusively
       double? finalFootprint = await _estimateCarbonFootprint(currentDetectedClass, detectedWeightKg);
 
       if (finalFootprint == null || finalFootprint.isNaN || finalFootprint <= 0) {
@@ -656,29 +806,46 @@ class _ScannerPageState extends State<ScannerPage> {
 
       if (!mounted || _isCancelled) return;
       if (_isDialogShowing) {
-        Navigator.pop(context);
+        Navigator.pop(context, 'system_transition');
+        _isDialogShowing = false;
       }
       setState(() {
-        _detectedClass = currentDetectedClass.replaceAll('_', ' ').toUpperCase();
+        _yoloCategory = currentDetectedClass;
+        _detectedClass = uiItemName; // Use pretty name for UI
         _carbonFootprint = finalFootprint!;
       });
-      _showSuccessPopup(finalImage.path);
+      _showSuccessPopup(finalImage.path); // guaranteed non-null here
 
     } catch (e) {
       if (e.toString().contains("cancelled_by_user")) {
         debugPrint("Pipeline gracefully aborted by user.");
+
+        // Critical: Force UI reset when the user explicitly cancels from any dialog
+        if (mounted) {
+          setState(() {
+            _isDialogShowing = false;
+            _useNativeYoloView = true;
+            _capturedImagePath = null;
+            // DO NOT reset _isAnalyzing to false instantly! We need a cooldown.
+          });
+          // Safety Cooldown: Keep buttons locked for 2.5s to prevent SIGSEGV from rapid unmounting!
+          Future.delayed(const Duration(milliseconds: 2500), () {
+            if (mounted) setState(() => _isAnalyzing = false);
+          });
+        }
         return;
       }
 
       debugPrint("Pipeline Error: $e");
       if (!mounted) return;
       if (_isDialogShowing) {
-        Navigator.pop(context);
+        Navigator.pop(context, 'system_transition');
         _isDialogShowing = false;
       }
       _showFailurePopup();
     } finally {
-      if (mounted) setState(() => _isAnalyzing = false);
+      // NOTE: _isAnalyzing cooldown takes priority if cancelled_by_user is triggered.
+      if (mounted && !_isCancelled) setState(() => _isAnalyzing = false);
       _pipelineController?.close();
     }
   }
@@ -690,7 +857,7 @@ class _ScannerPageState extends State<ScannerPage> {
       builder: (context) => _SuccessPopup(
         imagePath: imagePath,
         category: _getCategory(),
-        itemName: _detectedClass,
+        itemName: _detectedClass, // Displays beautiful OFF name
         carbonFootprint: _carbonFootprint,
         onAdd: () async {
           final userProvider = Provider.of<UserProvider>(context, listen: false);
@@ -700,7 +867,13 @@ class _ScannerPageState extends State<ScannerPage> {
             setState(() {
               _isDialogShowing = false;
               _useNativeYoloView = true; // Restore Native Stream
+              _capturedImagePath = null;
+              _isAnalyzing = true; // Engage Safety Cooldown
             });
+            Future.delayed(const Duration(milliseconds: 2500), () {
+              if (mounted) setState(() => _isAnalyzing = false);
+            });
+
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(
                 content: Text("Impact successfully added!"),
@@ -714,6 +887,11 @@ class _ScannerPageState extends State<ScannerPage> {
           setState(() {
             _isDialogShowing = false;
             _useNativeYoloView = true; // Restore Native Stream
+            _capturedImagePath = null;
+            _isAnalyzing = true; // Engage Safety Cooldown
+          });
+          Future.delayed(const Duration(milliseconds: 2500), () {
+            if (mounted) setState(() => _isAnalyzing = false);
           });
         },
       ),
@@ -730,6 +908,11 @@ class _ScannerPageState extends State<ScannerPage> {
           setState(() {
             _isDialogShowing = false;
             _useNativeYoloView = true; // Restore Native Stream
+            _capturedImagePath = null;
+            _isAnalyzing = true; // Engage Safety Cooldown
+          });
+          Future.delayed(const Duration(milliseconds: 2500), () {
+            if (mounted) setState(() => _isAnalyzing = false);
           });
         },
       ),
@@ -737,7 +920,7 @@ class _ScannerPageState extends State<ScannerPage> {
   }
 
   String _getCategory() {
-    String name = _detectedClass.toUpperCase();
+    String name = _yoloCategory.toUpperCase(); // Rely on YOLO logic, not UI name
     if (name.contains('DRINK') || name.contains('FOOD') || name.contains('NOODLE') || name.contains('RICE') || name.contains('SNACK')) {
       return 'Food & Drink';
     }
@@ -769,7 +952,7 @@ class _ScannerPageState extends State<ScannerPage> {
                 ? (_useNativeYoloView
             // Native YOLOView handles its own live streaming and bounding boxes
                 ? YOLOView(
-              modelPath: '${Directory.systemTemp.path}/yolo.tflite',
+              modelPath: '${Directory.systemTemp.path}/yolo_f16_live.tflite', // Specific file for LIVE FEED
               task: YOLOTask.detect,
               onResult: (results) {
                 if (results.isEmpty) return;
@@ -802,15 +985,18 @@ class _ScannerPageState extends State<ScannerPage> {
                   }
                 }
 
-                if (bestConf > 0.15) {
+                // Increased from 0.15 to filter out background noise based on FP16 metrics
+                if (bestConf > 0.545) {
                   _liveDetectedClass = bestLabel;
                   _liveDetectedConf = bestConf;
                   _lastDetectionTime = DateTime.now();
                 }
               },
             )
-            // Loading screen while CameraController takes the 12MP shot silently
-                : const Center(child: CircularProgressIndicator(color: brandGreen)))
+            // 2. Freezes frame perfectly when camera stops during dialogs
+                : (_capturedImagePath != null
+                ? Image.file(File(_capturedImagePath!), fit: BoxFit.cover)
+                : const Center(child: CircularProgressIndicator(color: brandGreen))))
                 : const Center(child: CircularProgressIndicator(color: brandGreen)),
           ),
 
@@ -868,7 +1054,8 @@ class _ScannerPageState extends State<ScannerPage> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   GestureDetector(
-                    onTap: () => _runPipeline(),
+                    // Prevent tapping while a pipeline is already running/starting
+                    onTap: _isAnalyzing ? null : () => _runPipeline(),
                     child: Container(
                       height: 84,
                       width: 84,
@@ -896,7 +1083,8 @@ class _ScannerPageState extends State<ScannerPage> {
                   ),
                   const SizedBox(height: 24),
                   TextButton(
-                    onPressed: () async {
+                    // Prevent tapping while a pipeline is already running/starting
+                    onPressed: _isAnalyzing ? null : () async {
                       final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
                       if (image != null) {
                         _runPipeline(preSelectedImage: image);
@@ -921,6 +1109,228 @@ class _ScannerPageState extends State<ScannerPage> {
   }
 }
 
+// ============================================================================
+// OCR VERIFICATION DIALOG
+// ============================================================================
+class _OcrVerificationDialog extends StatefulWidget {
+  final String imagePath;
+  final List<TextBlock> textBlocks;
+  final String initialQuery;
+  final double initialWeight;
+  final bool weightFound;
+
+  const _OcrVerificationDialog({
+    required this.imagePath,
+    required this.textBlocks,
+    required this.initialQuery,
+    required this.initialWeight,
+    required this.weightFound,
+  });
+
+  @override
+  State<_OcrVerificationDialog> createState() => _OcrVerificationDialogState();
+}
+
+class _OcrVerificationDialogState extends State<_OcrVerificationDialog> {
+  late TextEditingController _queryController;
+  late TextEditingController _weightController;
+  final FocusNode _queryFocus = FocusNode();
+  final FocusNode _weightFocus = FocusNode();
+
+  final Color brandNavy = const Color(0xFF2D3E50);
+  final Color brandGreen = const Color(0xFFC8FFB0);
+
+  @override
+  void initState() {
+    super.initState();
+    _queryController = TextEditingController(text: widget.initialQuery);
+    _weightController = TextEditingController(
+        text: widget.weightFound ? (widget.initialWeight * 1000).toStringAsFixed(0) : "");
+  }
+
+  @override
+  void dispose() {
+    _queryController.dispose();
+    _weightController.dispose();
+    _queryFocus.dispose();
+    _weightFocus.dispose();
+    super.dispose();
+  }
+
+  void _onChipTapped(String text) {
+    if (_weightFocus.hasFocus) {
+      _weightController.text = text;
+      _weightController.selection = TextSelection.collapsed(offset: _weightController.text.length);
+    } else {
+      // Default to adding to query
+      final currentText = _queryController.text.trim();
+      _queryController.text = currentText.isEmpty ? text : "$currentText $text";
+      _queryController.selection = TextSelection.collapsed(offset: _queryController.text.length);
+      if (!_queryFocus.hasFocus) {
+        FocusScope.of(context).requestFocus(_queryFocus);
+      }
+    }
+  }
+
+  void _submit() {
+    double parsedWeight = double.tryParse(_weightController.text) ?? 0.0;
+    double finalWeightKg = parsedWeight > 0 ? (parsedWeight / 1000.0) : widget.initialWeight;
+
+    Navigator.pop(context, {
+      'query': _queryController.text.trim(),
+      'weight': finalWeightKg,
+      'weightFound': _weightController.text.trim().isNotEmpty,
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(24),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // Header Image
+            ClipRRect(
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+              child: SizedBox(
+                height: 120,
+                width: double.infinity,
+                child: Image.file(
+                  File(widget.imagePath),
+                  fit: BoxFit.cover,
+                ),
+              ),
+            ),
+
+            Flexible(
+              child: SingleChildScrollView(
+                padding: const EdgeInsets.all(20),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text(
+                      "Verify Scanned Text",
+                      style: TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.w900,
+                        color: Color(0xFF2D3E50),
+                      ),
+                    ),
+                    const SizedBox(height: 6),
+                    const Text(
+                      "Tap the extracted text chips below to build your search query, or type manually.",
+                      style: TextStyle(fontSize: 13, color: Colors.black54, height: 1.4),
+                    ),
+                    const SizedBox(height: 16),
+
+                    // Chips container
+                    Container(
+                      constraints: const BoxConstraints(maxHeight: 140),
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.grey.shade100,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(color: Colors.grey.shade300),
+                      ),
+                      child: SingleChildScrollView(
+                        child: Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: widget.textBlocks.map((block) {
+                            String text = block.text.replaceAll('\n', ' ').trim();
+                            return ActionChip(
+                              label: Text(text, style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                              backgroundColor: Colors.white,
+                              side: BorderSide(color: brandGreen, width: 1.5),
+                              onPressed: () => _onChipTapped(text),
+                            );
+                          }).toList(),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 20),
+
+                    // Inputs
+                    TextField(
+                      controller: _queryController,
+                      focusNode: _queryFocus,
+                      decoration: InputDecoration(
+                        labelText: "Search Query (Brand/Item)",
+                        labelStyle: TextStyle(color: brandNavy.withValues(alpha: 0.6), fontWeight: FontWeight.w600),
+                        filled: true,
+                        fillColor: brandNavy.withValues(alpha: 0.05),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+                        focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: brandGreen, width: 2)),
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: _weightController,
+                      focusNode: _weightFocus,
+                      keyboardType: TextInputType.number,
+                      decoration: InputDecoration(
+                        labelText: "Weight (in Grams or mL)",
+                        labelStyle: TextStyle(color: brandNavy.withValues(alpha: 0.6), fontWeight: FontWeight.w600),
+                        filled: true,
+                        fillColor: brandNavy.withValues(alpha: 0.05),
+                        border: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide.none),
+                        focusedBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(12), borderSide: BorderSide(color: brandGreen, width: 2)),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+
+            // Action Buttons
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 20),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: TextButton(
+                      onPressed: () => Navigator.pop(context, null),
+                      style: TextButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
+                      child: const Text("CANCEL", style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.w800)),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: ElevatedButton(
+                      onPressed: _submit,
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: brandNavy,
+                        foregroundColor: Colors.white,
+                        elevation: 0,
+                        padding: const EdgeInsets.symmetric(vertical: 14),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      ),
+                      child: const Text("CONFIRM", style: TextStyle(fontWeight: FontWeight.w900)),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+// ============================================================================
+
+
 class _ProcessingDialog extends StatefulWidget {
   final Stream<PipelineUpdate> updateStream;
   final List<PipelineUpdate> initialLogs;
@@ -941,6 +1351,7 @@ class _ProcessingDialog extends StatefulWidget {
 class _ProcessingDialogState extends State<_ProcessingDialog> {
   int _currentProgress = 0;
   final List<PipelineUpdate> _logs = [];
+  late StreamSubscription<PipelineUpdate> _subscription;
 
   @override
   void initState() {
@@ -948,7 +1359,7 @@ class _ProcessingDialogState extends State<_ProcessingDialog> {
     _currentProgress = widget.initialProgress;
     _logs.addAll(widget.initialLogs);
 
-    widget.updateStream.listen((update) {
+    _subscription = widget.updateStream.listen((update) {
       if (mounted) {
         setState(() {
           _currentProgress = update.progress;
@@ -959,6 +1370,12 @@ class _ProcessingDialogState extends State<_ProcessingDialog> {
   }
 
   @override
+  void dispose() {
+    _subscription.cancel();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     const Color brandNavy = Color(0xFF2D3E50);
     const Color brandGreen = Color(0xFFC8FFB0);
@@ -966,8 +1383,10 @@ class _ProcessingDialogState extends State<_ProcessingDialog> {
     return PopScope(
       canPop: true,
       onPopInvokedWithResult: (didPop, result) {
-        if (didPop) {
-          widget.onCancel(true); // true = popped by Android system back button
+        // ONLY trigger cancellation if it was a true user interaction (back button),
+        // NOT a programmed system pop transition!
+        if (didPop && result != 'system_transition') {
+          widget.onCancel(true);
         }
       },
       child: Dialog(
@@ -1157,29 +1576,35 @@ class _SuccessPopup extends StatelessWidget {
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(
-                            category.toUpperCase(),
-                            style: TextStyle(
-                              color: brandNavy.withValues(alpha: 0.5),
-                              fontSize: 11,
-                              fontWeight: FontWeight.w800,
-                              letterSpacing: 1.2,
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(
+                              category.toUpperCase(),
+                              style: TextStyle(
+                                color: brandNavy.withValues(alpha: 0.5),
+                                fontSize: 11,
+                                fontWeight: FontWeight.w800,
+                                letterSpacing: 1.2,
+                              ),
                             ),
-                          ),
-                          const SizedBox(height: 4),
-                          Text(
-                            itemName,
-                            style: const TextStyle(
-                              color: brandNavy,
-                              fontSize: 22,
-                              fontWeight: FontWeight.w900,
+                            const SizedBox(height: 4),
+                            Text(
+                              itemName,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                color: brandNavy,
+                                fontSize: 22,
+                                fontWeight: FontWeight.w900,
+                                height: 1.1,
+                              ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
+                      const SizedBox(width: 8),
                       Container(
                         padding: const EdgeInsets.all(10),
                         decoration: BoxDecoration(
@@ -1290,6 +1715,13 @@ class _FailurePopup extends StatelessWidget {
         decoration: BoxDecoration(
           color: Colors.white.withValues(alpha: 0.95),
           borderRadius: BorderRadius.circular(32),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withValues(alpha: 0.2),
+              blurRadius: 30,
+              offset: const Offset(0, 15),
+            ),
+          ],
         ),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -1479,6 +1911,167 @@ class _ScannerInstructionDialogState extends State<_ScannerInstructionDialog> {
                   ),
                 ),
               ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================================================
+// PRODUCT SELECTION DIALOG
+// ============================================================================
+class _ProductSelectionDialog extends StatefulWidget {
+  final List<Product> products;
+
+  const _ProductSelectionDialog({required this.products});
+
+  @override
+  State<_ProductSelectionDialog> createState() => _ProductSelectionDialogState();
+}
+
+class _ProductSelectionDialogState extends State<_ProductSelectionDialog> {
+  int _currentPage = 0;
+  static const int _itemsPerPage = 3;
+
+  @override
+  Widget build(BuildContext context) {
+    const Color brandNavy = Color(0xFF2D3E50);
+
+    final int totalPages = (widget.products.length / _itemsPerPage).ceil();
+    final List<Product> displayedProducts = widget.products
+        .skip(_currentPage * _itemsPerPage)
+        .take(_itemsPerPage)
+        .toList();
+
+    return Dialog(
+      backgroundColor: Colors.transparent,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 24),
+      child: Container(
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(24),
+        ),
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Text(
+              "Select Product",
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.w900,
+                color: brandNavy,
+              ),
+            ),
+            const SizedBox(height: 8),
+            const Text(
+              "Please select the correct item from the database, or skip if it's not listed:",
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 13, color: Colors.black54),
+            ),
+            const SizedBox(height: 16),
+            Flexible(
+              child: ListView.separated(
+                shrinkWrap: true,
+                itemCount: displayedProducts.length,
+                separatorBuilder: (_, __) => const Divider(height: 1),
+                itemBuilder: (context, index) {
+                  final p = displayedProducts[index];
+                  final name = p.productName != null && p.productName!.isNotEmpty ? p.productName! : "Unknown Product";
+                  final brand = p.brands != null && p.brands!.isNotEmpty ? p.brands! : "Unknown Brand";
+                  final quantity = p.quantity != null && p.quantity!.isNotEmpty ? p.quantity! : "Unknown Qty";
+
+                  return ListTile(
+                    contentPadding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+                    leading: ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: p.imageFrontSmallUrl != null
+                          ? Image.network(
+                        p.imageFrontSmallUrl!,
+                        width: 48,
+                        height: 48,
+                        fit: BoxFit.cover,
+                        errorBuilder: (c, e, s) => Container(
+                          width: 48, height: 48, color: Colors.grey[200],
+                          child: const Icon(Icons.shopping_bag, color: Colors.grey),
+                        ),
+                      )
+                          : Container(
+                        width: 48, height: 48, color: Colors.grey[200],
+                        child: const Icon(Icons.shopping_bag, color: Colors.grey),
+                      ),
+                    ),
+                    title: Text(
+                      name,
+                      style: const TextStyle(fontWeight: FontWeight.w800, fontSize: 14, color: brandNavy),
+                      maxLines: 2,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                    subtitle: Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Text(
+                        "$brand • $quantity",
+                        style: const TextStyle(fontSize: 12, color: brandNavy, fontWeight: FontWeight.w600),
+                      ),
+                    ),
+                    onTap: () => Navigator.pop(context, p),
+                  );
+                },
+              ),
+            ),
+            if (totalPages > 1) ...[
+              const SizedBox(height: 8),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.arrow_back_ios_new_rounded, size: 16),
+                    color: _currentPage > 0 ? brandNavy : Colors.grey,
+                    onPressed: _currentPage > 0 ? () => setState(() => _currentPage--) : null,
+                  ),
+                  Text(
+                    "Page ${_currentPage + 1} of $totalPages",
+                    style: const TextStyle(fontSize: 12, fontWeight: FontWeight.bold, color: brandNavy),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.arrow_forward_ios_rounded, size: 16),
+                    color: _currentPage < totalPages - 1 ? brandNavy : Colors.grey,
+                    onPressed: _currentPage < totalPages - 1 ? () => setState(() => _currentPage++) : null,
+                  ),
+                ],
+              ),
+            ],
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(
+                  child: TextButton(
+                    onPressed: () => Navigator.pop(context, 'cancel'),
+                    style: TextButton.styleFrom(
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                      backgroundColor: Colors.red.withValues(alpha: 0.1),
+                    ),
+                    child: const Text("CANCEL", style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.w800)),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: ElevatedButton(
+                    onPressed: () => Navigator.pop(context, 'skip'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: brandNavy,
+                      foregroundColor: Colors.white,
+                      elevation: 0,
+                      padding: const EdgeInsets.symmetric(vertical: 14),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                    ),
+                    child: const Text("SKIP", style: TextStyle(fontWeight: FontWeight.w900)),
+                  ),
+                ),
+              ],
             ),
           ],
         ),

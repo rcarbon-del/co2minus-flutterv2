@@ -3,7 +3,7 @@
 -keep class com.google.mlkit.vision.text.** { *; }
 
 #Google Play Services ML
--keep class com.google.android.gms.internal.ml.** { ; }
+-keep class com.google.android.gms.internal.ml.** { *; }
 -dontwarn com.google.android.gms.internal.ml.*
 
 #Ignore missing optional ML Kit libraries
@@ -25,3 +25,13 @@
 -keepclassmembers class org.tensorflow.lite.** { *; }
 -keep class org.tensorflow.lite.flex.* { *; }
 -keep class java.nio.* { *; }
+
+# Fix for SnakeYAML / openfoodfacts missing java.beans classes
+-dontwarn org.yaml.snakeyaml.**
+-keep class org.yaml.snakeyaml.** { *; }
+-dontwarn java.beans.BeanInfo
+-dontwarn java.beans.FeatureDescriptor
+-dontwarn java.beans.IntrospectionException
+-dontwarn java.beans.Introspector
+-dontwarn java.beans.PropertyDescriptor
+-dontwarn java.beans.**
