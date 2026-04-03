@@ -13,6 +13,7 @@ import 'package:provider/provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:image_picker/image_picker.dart';
 import 'package:openfoodfacts/openfoodfacts.dart';
+import 'package:torch_light/torch_light.dart'; // Handles native hardware flash bypass
 
 // Google LiteRT (Formerly TensorFlow Lite Flutter)
 import 'package:flutter_litert/flutter_litert.dart';
@@ -80,6 +81,13 @@ class _ScannerPageState extends State<ScannerPage> {
   double _liveDetectedConf = 0.0;
   DateTime? _lastDetectionTime;
 
+  // Temporal Smoothing (Streak Filter, Forgiveness Buffer & Thermal Throttle)
+  String _currentStreakClass = "";
+  double _currentStreakConf = 0.0; // Captures real-time confidence for the UI Pill
+  int _streakCount = 0;
+  int _missedFrames = 0;
+  int _lastYoloFrameTime = 0;
+
   final TextRecognizer _textRecognizer = TextRecognizer();
   final ImagePicker _picker = ImagePicker();
   bool _isCancelled = false;
@@ -88,8 +96,6 @@ class _ScannerPageState extends State<ScannerPage> {
   Map<String, dynamic>? _lcaDatabase;
   Map<String, dynamic>? _scalerConfig;
   YOLO? _yoloPlugin; // Used purely for static image uploads
-
-  String _diagnosticMessage = "Initializing systems...";
 
   bool _isDialogShowing = false;
   bool _isAnalyzing = false;
@@ -116,25 +122,20 @@ class _ScannerPageState extends State<ScannerPage> {
   }
 
   Future<void> _initializeSystem() async {
-    String diag = "";
     try {
       final cameras = await availableCameras();
-      if (cameras.isNotEmpty) {
-        diag += "✅ Camera Hardware\n";
-      } else {
-        diag += "❌ Camera Hardware (Not Found)\n";
+      if (cameras.isEmpty) {
+        debugPrint("❌ Camera Hardware Not Found");
       }
 
       try {
         final lcaString = await rootBundle.loadString('assets/flutter_lca_database.json');
         _lcaDatabase = json.decode(lcaString);
-        diag += "✅ LCA Database\n";
 
         final scalerString = await rootBundle.loadString('assets/flutter_scaler_config.json');
         _scalerConfig = json.decode(scalerString);
-        diag += "✅ Scaler Config\n";
       } catch (e) {
-        diag += "❌ JSON Databases Error: $e\n";
+        debugPrint("❌ JSON Databases Error: $e");
       }
 
       try {
@@ -161,25 +162,22 @@ class _ScannerPageState extends State<ScannerPage> {
           task: YOLOTask.detect,
         );
         await _yoloPlugin!.loadModel();
-        diag += "✅ YOLO26 Vision Model (FP16)\n";
       } catch (e) {
-        diag += "❌ YOLO26 Model Error: $e\n";
+        debugPrint("❌ YOLO26 Model Error: $e");
       }
 
       try {
         _gruInterpreter = await Interpreter.fromAsset('assets/models/gru.tflite');
-        diag += "✅ GRU Estimation Model (LiteRT)\n";
       } catch (e) {
-        diag += "❌ GRU Model Error: $e\n";
+        debugPrint("❌ GRU Model Error: $e");
       }
 
     } catch (e) {
-      diag += "\nCritical System Error: $e";
+      debugPrint("\nCritical System Error: $e");
     }
 
     if (mounted) {
       setState(() {
-        _diagnosticMessage = diag;
         _isInitialized = true;
       });
     }
@@ -197,65 +195,12 @@ class _ScannerPageState extends State<ScannerPage> {
       );
     }
 
-    if (mounted) {
-      await _showDiagnosticDialog();
-    }
-
     // Only start the camera feed AFTER the startup dialogs are fully closed
     if (mounted) {
       setState(() {
         _useNativeYoloView = true;
       });
     }
-  }
-
-  Future<void> _showDiagnosticDialog() {
-    return showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => Dialog(
-        backgroundColor: Colors.transparent,
-        child: Container(
-          padding: const EdgeInsets.all(24),
-          decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.95),
-            borderRadius: BorderRadius.circular(24),
-            border: Border.all(color: const Color(0xFF2D3E50), width: 2),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              const Center(
-                child: Text(
-                  "SYSTEM DIAGNOSTICS",
-                  style: TextStyle(color: Color(0xFF2D3E50), fontSize: 18, fontWeight: FontWeight.w900),
-                ),
-              ),
-              const SizedBox(height: 16),
-              Text(
-                _diagnosticMessage,
-                style: const TextStyle(color: Color(0xFF2D3E50), fontSize: 14, fontWeight: FontWeight.w600, height: 1.5),
-              ),
-              const SizedBox(height: 24),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF2D3E50),
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                  ),
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text("PROCEED", style: TextStyle(fontWeight: FontWeight.w900)),
-                ),
-              )
-            ],
-          ),
-        ),
-      ),
-    );
   }
 
   void _emitUpdate(int progress, String step, String detail) {
@@ -280,6 +225,10 @@ class _ScannerPageState extends State<ScannerPage> {
       setState(() {
         _useNativeYoloView = true; // Restore the live stream
         _capturedImagePath = null; // Clear frozen frame
+        _streakCount = 0; // Reset streaks
+        _missedFrames = 0;
+        _currentStreakClass = "";
+        _currentStreakConf = 0.0;
       });
       // Safety Cooldown: Keep buttons locked for 2.5s to prevent SIGSEGV from rapid unmounting!
       Future.delayed(const Duration(milliseconds: 2500), () {
@@ -296,13 +245,13 @@ class _ScannerPageState extends State<ScannerPage> {
 
       final resultsMap = await _yoloPlugin!.predict(
         fixedBytes,
-        // Using a more forgiving threshold for static image uploads
-        // since we don't have a 30FPS live stream to catch the perfect angle.
-        confidenceThreshold: 0.30,
+        // Send a low threshold to the plugin so we grab all candidates,
+        // we will filter them using our custom math below!
+        confidenceThreshold: 0.20,
       );
 
       if (resultsMap.isNotEmpty) {
-        double bestConf = 0.0;
+        double bestWeightedScore = 0.0;
         String bestLabel = "";
 
         resultsMap.forEach((key, value) {
@@ -312,9 +261,37 @@ class _ScannerPageState extends State<ScannerPage> {
                 double conf = (item['confidence'] ?? item['score'] ?? 0.0).toDouble();
                 String label = (item['className'] ?? item['label'] ?? item['class'] ?? "").toString();
 
-                if (conf > bestConf && label.isNotEmpty) {
-                  bestConf = conf;
-                  bestLabel = label;
+                // 1. DYNAMIC THRESHOLDS FOR STATIC UPLOADS
+                double requiredThreshold = 0.30;
+                if (label == "instant_noodles" || label == "snack_pack") {
+                  requiredThreshold = 0.50; // Stricter for noisy textures
+                } else if (label == "cleaning_product" || label == "personal_care") {
+                  requiredThreshold = 0.40;
+                }
+
+                if (conf >= requiredThreshold && label.isNotEmpty) {
+                  // 2. AREA-WEIGHTED SCORING (The "Subject" Filter)
+                  // Grabs the size of the bounding box to calculate surface area
+                  double l = (item['left'] ?? item['xMin'] ?? 0.0).toDouble();
+                  double t = (item['top'] ?? item['yMin'] ?? 0.0).toDouble();
+                  double r = (item['right'] ?? item['xMax'] ?? 0.0).toDouble();
+                  double b = (item['bottom'] ?? item['yMax'] ?? 0.0).toDouble();
+
+                  double w = (item['width'] ?? (r - l).abs()).toDouble();
+                  double h = (item['height'] ?? (b - t).abs()).toDouble();
+
+                  double boxArea = w * h;
+                  // Failsafe: if plugin didn't provide coordinates, default to 1.0 (pure confidence)
+                  if (boxArea <= 0.0) boxArea = 1.0;
+
+                  // Multiply confidence by Area. This mathematically guarantees that a
+                  // huge, prominent 35% Coke can will instantly outscore a tiny 90% background bottle.
+                  double weightedScore = conf * boxArea;
+
+                  if (weightedScore > bestWeightedScore) {
+                    bestWeightedScore = weightedScore;
+                    bestLabel = label;
+                  }
                 }
               }
             }
@@ -388,57 +365,6 @@ class _ScannerPageState extends State<ScannerPage> {
     return weightGrams / 1000.0;
   }
 
-  Future<void> _debugPause(String stepName, String details) async {
-    if (!mounted || _isCancelled) return;
-    return showDialog<void>(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => Dialog(
-        backgroundColor: Colors.transparent,
-        child: Container(
-          padding: const EdgeInsets.all(24),
-          decoration: BoxDecoration(
-            color: Colors.white.withValues(alpha: 0.95),
-            borderRadius: BorderRadius.circular(24),
-            border: Border.all(color: const Color(0xFFC8FFB0), width: 2),
-          ),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Icon(Icons.bug_report_rounded, color: Color(0xFF2D3E50), size: 32),
-              const SizedBox(height: 16),
-              Text(
-                "DEBUG: $stepName",
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Color(0xFF2D3E50), fontSize: 18, fontWeight: FontWeight.w900, letterSpacing: 1.0),
-              ),
-              const SizedBox(height: 12),
-              Text(
-                details,
-                textAlign: TextAlign.center,
-                style: const TextStyle(color: Color(0xFF2D3E50), fontSize: 14, fontWeight: FontWeight.w600),
-              ),
-              const SizedBox(height: 24),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF2D3E50),
-                    foregroundColor: Colors.white,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-                    padding: const EdgeInsets.symmetric(vertical: 12),
-                  ),
-                  onPressed: () => Navigator.pop(context),
-                  child: const Text("CONFIRM & CONTINUE", style: TextStyle(fontWeight: FontWeight.w900)),
-                ),
-              )
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
   Future<void> _runPipeline({XFile? preSelectedImage}) async {
     if (_isDialogShowing || _isAnalyzing) return;
     if (preSelectedImage == null && !_isInitialized) return;
@@ -448,11 +374,21 @@ class _ScannerPageState extends State<ScannerPage> {
       _isDialogShowing = true;
       _isCancelled = false; // Reset on start
       _useNativeYoloView = false; // IMMEDIATELY unmount and stop the live camera feed
+      _streakCount = 0;
+      _missedFrames = 0;
     });
+
+    // Ensure the native flash is safely turned off before camera control swaps
+    if (_isFlashOn) {
+      try {
+        await TorchLight.disableTorch();
+        _isFlashOn = false;
+      } catch (_) {}
+    }
 
     if (preSelectedImage != null) {
       setState(() {
-        _capturedImagePath = preSelectedImage.path; // Freeze UI immediately on selected image
+        _capturedImagePath = preSelectedImage!.path; // Added '!' to fix null-safety error
       });
     }
 
@@ -473,14 +409,14 @@ class _ScannerPageState extends State<ScannerPage> {
     );
 
     try {
-      XFile? finalImage;
+      String finalImagePath = "";
       String currentDetectedClass = "";
       String uiItemName = "";
 
       if (preSelectedImage != null) {
         // --- MANUAL UPLOAD LOGIC ---
         _emitUpdate(5, "1. Image Upload", "Safely allocating memory...");
-        finalImage = preSelectedImage;
+        finalImagePath = preSelectedImage!.path; // Added '!' here too just in case
 
         // Wait 2500ms for YOLOView to fully unmount before running static YOLO prediction
         // This prevents the SIGSEGV crash caused by GPU delegate memory conflicts!
@@ -488,7 +424,7 @@ class _ScannerPageState extends State<ScannerPage> {
         if (_isCancelled) throw Exception("cancelled_by_user");
 
         _emitUpdate(10, "1. Image Upload", "Analyzing uploaded image...");
-        String? yoloResult = await _runYoloInference(finalImage.path);
+        String? yoloResult = await _runYoloInference(finalImagePath);
         if (yoloResult == null) {
           throw Exception("YOLO could not classify item.");
         }
@@ -500,6 +436,7 @@ class _ScannerPageState extends State<ScannerPage> {
         _emitUpdate(5, "1. Live Detection", "Locking YOLO prediction...");
 
         // Failsafe: Ensure YOLO actually saw something within the last 1.5 seconds!
+        // Because _liveDetectedClass stays in memory for 1.5s, the user has a generous window to tap scan.
         if (_liveDetectedClass.isEmpty || _lastDetectionTime == null || DateTime.now().difference(_lastDetectionTime!).inMilliseconds > 1500) {
           throw Exception("No clear object detected. Please aim at an object first.");
         }
@@ -520,20 +457,23 @@ class _ScannerPageState extends State<ScannerPage> {
           final cameras = await availableCameras();
           _controller = CameraController(
             cameras.first,
-            ResolutionPreset.max, // Perfect OCR clarity
+            // Optimization 2: Cap resolution to veryHigh (1080p-2160p) to completely prevent
+            // Out-Of-Memory (OOM) crashes on low-end devices with 108MP/200MP sensors!
+            ResolutionPreset.veryHigh,
             enableAudio: false,
             imageFormatGroup: ImageFormatGroup.nv21,
           );
           await _controller!.initialize();
           if (_isCancelled) throw Exception("cancelled_by_user");
 
-          _emitUpdate(30, "3. Image Capture", "Taking 12MP snapshot for OCR...");
-          finalImage = await _controller!.takePicture();
+          _emitUpdate(30, "3. Image Capture", "Taking high-res snapshot for OCR...");
+          final XFile capturedImage = await _controller!.takePicture();
+          finalImagePath = capturedImage.path;
 
           // Freeze the captured image beautifully in the background
           if (mounted) {
             setState(() {
-              _capturedImagePath = finalImage!.path;
+              _capturedImagePath = finalImagePath;
             });
           }
         } finally {
@@ -545,12 +485,16 @@ class _ScannerPageState extends State<ScannerPage> {
 
       if (_isCancelled) throw Exception("cancelled_by_user");
 
+      // Optimization 4: Aggressive Garbage Collection
+      // Dereference the heavy preSelectedImage XFile before heavy API/ML Kit work
+      preSelectedImage = null;
+
       // Default to YOLO Class Name for UI unless OFF provides a better one
       uiItemName = currentDetectedClass.replaceAll('_', ' ').toUpperCase();
 
       // STEP 2: OCR Data Extraction
       _emitUpdate(50, "4. Data Extraction (OCR)", "Scanning packaging for weight & labels...");
-      final InputImage inputImage = InputImage.fromFilePath(finalImage.path);
+      final InputImage inputImage = InputImage.fromFilePath(finalImagePath);
       final RecognizedText recognizedText = await _textRecognizer.processImage(inputImage);
       String ocrText = recognizedText.text.replaceAll('\n', ' ').toLowerCase();
 
@@ -570,7 +514,8 @@ class _ScannerPageState extends State<ScannerPage> {
         }
       }
 
-      String ocrSearchContext = prominentText.take(5).join(' ');
+      // We intentionally leave the initial query empty so the user builds it from the chips
+      String ocrSearchContext = "";
       String detectedBrand = prominentText.isNotEmpty ? prominentText.first.toUpperCase() : "";
 
       if (_isCancelled) throw Exception("cancelled_by_user");
@@ -611,7 +556,7 @@ class _ScannerPageState extends State<ScannerPage> {
         context: context,
         barrierDismissible: false,
         builder: (context) => _OcrVerificationDialog(
-          imagePath: finalImage!.path,
+          imagePath: finalImagePath,
           textBlocks: sortedBlocks,
           initialQuery: ocrSearchContext,
           initialWeight: detectedWeightKg,
@@ -750,7 +695,6 @@ class _ScannerPageState extends State<ScannerPage> {
       String extText = "W: $weightDisplay | B: $detectedBrand";
 
       _emitUpdate(65, "4. Data Extraction", extText);
-      await _debugPause("Data Extracted", extText);
       if (_isCancelled) throw Exception("cancelled_by_user");
 
       // STEP 3: Volumetric Failsafe (AR Removed)
@@ -763,23 +707,57 @@ class _ScannerPageState extends State<ScannerPage> {
       }
 
       if (_isCancelled) throw Exception("cancelled_by_user");
-      await _debugPause("Volumetrics Complete", "Final Assigned Mass: ${(detectedWeightKg * 1000).toStringAsFixed(0)}g");
 
-      // STEP 4: AI Cross-Validation
+      // =======================================================================
+      // STEP 4: AI Cross-Validation (Robust Dictionaries)
+      // =======================================================================
       _emitUpdate(85, "6. Multi-Modal Validation", "Matching YOLO vision with text context...");
       await Future.delayed(const Duration(milliseconds: 800));
 
       bool isContradiction = false;
       String mismatchReason = "";
 
-      if (currentDetectedClass.contains("drink") && (ocrText.contains("shampoo") || ocrText.contains("soap") || ocrText.contains("cleaner"))) {
-        isContradiction = true; mismatchReason = "Detected Drink, but OCR read cleaning terms.";
-      } else if (currentDetectedClass == "cleaning_product" && (ocrText.contains("drink") || ocrText.contains("juice") || ocrText.contains("food"))) {
-        isContradiction = true; mismatchReason = "Detected Cleaner, but OCR read food/drink terms.";
-      } else if (currentDetectedClass == "can_food" && (ocrText.contains("drink") || ocrText.contains("beverage") || ocrText.contains("soda"))) {
-        isContradiction = true; mismatchReason = "Detected Food Can, but OCR read beverage terms.";
-      } else if (currentDetectedClass == "instant_noodles" && (ocrText.contains("drink") || ocrText.contains("shampoo"))) {
-        isContradiction = true; mismatchReason = "Detected Noodles, but OCR read unrelated terms.";
+      // Robust keyword dictionaries to catch YOLO hallucinations
+      final List<String> cleaningTerms = ['shampoo', 'soap', 'cleaner', 'detergent', 'wash', 'dish', 'laundry', 'surface', 'toilet', 'bleach', 'disinfectant'];
+      final List<String> personalCareTerms = ['shampoo', 'lotion', 'hair', 'skin', 'body', 'face', 'toothpaste', 'deodorant', 'conditioner', 'cream'];
+      final List<String> drinkTerms = ['drink', 'juice', 'beverage', 'soda', 'cola', 'water', 'tea', 'coffee', 'beer', 'wine', 'liquid', 'drinkable'];
+      final List<String> foodTerms = ['tuna', 'meat', 'fish', 'beans', 'soup', 'tomato', 'corn', 'beef', 'pork', 'chicken', 'fruit', 'vegetable', 'meal', 'sauce', 'sardines', 'mackerel'];
+
+      bool containsAny(String text, List<String> keywords) {
+        return keywords.any((k) => text.contains(k));
+      }
+
+      if (currentDetectedClass == "can_drink" || currentDetectedClass == "plastic-bottle") {
+        if (containsAny(ocrText, foodTerms)) {
+          isContradiction = true;
+          mismatchReason = "Detected Beverage, but OCR found solid food terms (e.g., meat/tuna/beans).";
+        } else if (containsAny(ocrText, cleaningTerms) || containsAny(ocrText, personalCareTerms)) {
+          isContradiction = true;
+          mismatchReason = "Detected Beverage, but OCR found cleaning or personal care terms.";
+        }
+      } else if (currentDetectedClass == "can_food") {
+        if (containsAny(ocrText, drinkTerms)) {
+          isContradiction = true;
+          mismatchReason = "Detected Canned Food, but OCR found beverage terms.";
+        } else if (containsAny(ocrText, cleaningTerms) || containsAny(ocrText, personalCareTerms)) {
+          isContradiction = true;
+          mismatchReason = "Detected Canned Food, but OCR found cleaning or personal care terms.";
+        }
+      } else if (currentDetectedClass == "cleaning_product" || currentDetectedClass == "personal_care") {
+        if (containsAny(ocrText, drinkTerms) || containsAny(ocrText, foodTerms)) {
+          isContradiction = true;
+          mismatchReason = "Detected Non-Food product, but OCR found food or drink terms.";
+        }
+      } else if (currentDetectedClass == "cooking_oil_bottle") {
+        if (containsAny(ocrText, cleaningTerms) || containsAny(ocrText, personalCareTerms)) {
+          isContradiction = true;
+          mismatchReason = "Detected Cooking Oil, but OCR found cleaning or personal care terms.";
+        }
+      } else if (currentDetectedClass == "instant_noodles" || currentDetectedClass == "snack_pack") {
+        if (containsAny(ocrText, cleaningTerms) || containsAny(ocrText, personalCareTerms) || containsAny(ocrText, drinkTerms)) {
+          isContradiction = true;
+          mismatchReason = "Detected Snack/Noodles, but OCR found unrelated non-food or drink terms.";
+        }
       }
 
       if (isContradiction) {
@@ -791,7 +769,9 @@ class _ScannerPageState extends State<ScannerPage> {
       _emitUpdate(90, "6. Multi-Modal Validation", "Data verified. No contradictions found.");
       if (_isCancelled) throw Exception("cancelled_by_user");
 
+      // =======================================================================
       // STEP 5: GRU Carbon Estimation
+      // =======================================================================
       _emitUpdate(95, "7. GRU Carbon Estimation", "Feeding validated sequence to RNN...");
 
       // Model uses YOLO class exclusively
@@ -802,7 +782,6 @@ class _ScannerPageState extends State<ScannerPage> {
       }
 
       _emitUpdate(100, "Sequence Complete", "Estimated Footprint: ${finalFootprint.toStringAsFixed(2)} kg CO2e");
-      await _debugPause("Step 5 Complete", "GRU Network output: ${finalFootprint.toStringAsFixed(2)} kg CO2e");
 
       if (!mounted || _isCancelled) return;
       if (_isDialogShowing) {
@@ -814,11 +793,11 @@ class _ScannerPageState extends State<ScannerPage> {
         _detectedClass = uiItemName; // Use pretty name for UI
         _carbonFootprint = finalFootprint!;
       });
-      _showSuccessPopup(finalImage.path); // guaranteed non-null here
+      _showSuccessPopup(finalImagePath);
 
     } catch (e) {
-      if (e.toString().contains("cancelled_by_user")) {
-        debugPrint("Pipeline gracefully aborted by user.");
+      if (e.toString().contains("cancelled_by_user") || e.toString().contains("Cross-validation failed")) {
+        debugPrint("Pipeline aborted: $e");
 
         // Critical: Force UI reset when the user explicitly cancels from any dialog
         if (mounted) {
@@ -826,6 +805,10 @@ class _ScannerPageState extends State<ScannerPage> {
             _isDialogShowing = false;
             _useNativeYoloView = true;
             _capturedImagePath = null;
+            _streakCount = 0;
+            _missedFrames = 0;
+            _currentStreakClass = "";
+            _currentStreakConf = 0.0;
             // DO NOT reset _isAnalyzing to false instantly! We need a cooldown.
           });
           // Safety Cooldown: Keep buttons locked for 2.5s to prevent SIGSEGV from rapid unmounting!
@@ -833,6 +816,12 @@ class _ScannerPageState extends State<ScannerPage> {
             if (mounted) setState(() => _isAnalyzing = false);
           });
         }
+
+        // If it was an AI contradiction, show the failure popup so the user knows *why* it stopped
+        if (e.toString().contains("Cross-validation failed")) {
+          _showFailurePopup(customMessage: e.toString().replaceAll("Exception: ", ""));
+        }
+
         return;
       }
 
@@ -868,6 +857,10 @@ class _ScannerPageState extends State<ScannerPage> {
               _isDialogShowing = false;
               _useNativeYoloView = true; // Restore Native Stream
               _capturedImagePath = null;
+              _streakCount = 0;
+              _missedFrames = 0;
+              _currentStreakClass = "";
+              _currentStreakConf = 0.0;
               _isAnalyzing = true; // Engage Safety Cooldown
             });
             Future.delayed(const Duration(milliseconds: 2500), () {
@@ -888,6 +881,10 @@ class _ScannerPageState extends State<ScannerPage> {
             _isDialogShowing = false;
             _useNativeYoloView = true; // Restore Native Stream
             _capturedImagePath = null;
+            _streakCount = 0;
+            _missedFrames = 0;
+            _currentStreakClass = "";
+            _currentStreakConf = 0.0;
             _isAnalyzing = true; // Engage Safety Cooldown
           });
           Future.delayed(const Duration(milliseconds: 2500), () {
@@ -898,17 +895,22 @@ class _ScannerPageState extends State<ScannerPage> {
     );
   }
 
-  void _showFailurePopup() {
+  void _showFailurePopup({String? customMessage}) {
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (context) => _FailurePopup(
+        message: customMessage ?? "We couldn't identify this item. Please ensure it's within the frame and has good lighting.",
         onRetry: () {
           Navigator.pop(context);
           setState(() {
             _isDialogShowing = false;
             _useNativeYoloView = true; // Restore Native Stream
             _capturedImagePath = null;
+            _streakCount = 0;
+            _missedFrames = 0;
+            _currentStreakClass = "";
+            _currentStreakConf = 0.0;
             _isAnalyzing = true; // Engage Safety Cooldown
           });
           Future.delayed(const Duration(milliseconds: 2500), () {
@@ -955,7 +957,29 @@ class _ScannerPageState extends State<ScannerPage> {
               modelPath: '${Directory.systemTemp.path}/yolo_f16_live.tflite', // Specific file for LIVE FEED
               task: YOLOTask.detect,
               onResult: (results) {
-                if (results.isEmpty) return;
+
+                // 1. FRAME THROTTLING (The Thermal Fix)
+                // Limit Dart-side processing to ~6 FPS to prevent CPU overheating on budget phones.
+                int currentTime = DateTime.now().millisecondsSinceEpoch;
+                if (currentTime - _lastYoloFrameTime < 150) return;
+                _lastYoloFrameTime = currentTime;
+
+                if (results.isEmpty) {
+                  // FORGIVENESS BUFFER: Forgive up to 2 empty/bad frames before breaking streak
+                  if (_streakCount > 0 && _missedFrames < 2) {
+                    _missedFrames++;
+                  } else {
+                    if (mounted) {
+                      setState(() {
+                        _streakCount = 0;
+                        _currentStreakClass = "";
+                        _currentStreakConf = 0.0;
+                        _missedFrames = 0;
+                      });
+                    }
+                  }
+                  return;
+                }
 
                 double bestConf = 0.0;
                 String bestLabel = "";
@@ -985,11 +1009,63 @@ class _ScannerPageState extends State<ScannerPage> {
                   }
                 }
 
-                // Increased from 0.15 to filter out background noise based on FP16 metrics
-                if (bestConf > 0.545) {
-                  _liveDetectedClass = bestLabel;
-                  _liveDetectedConf = bestConf;
-                  _lastDetectionTime = DateTime.now();
+                // 2. DYNAMIC CONFIDENCE FILTERING
+                double requiredThreshold = 0.545; // Default safe threshold
+                if (bestLabel == "instant_noodles" || bestLabel == "snack_pack") {
+                  requiredThreshold = 0.75; // Ghost heavily, need higher confidence
+                } else if (bestLabel == "cleaning_product" || bestLabel == "personal_care") {
+                  requiredThreshold = 0.65;
+                } else if (bestLabel == "can_drink" || bestLabel == "plastic-bottle") {
+                  requiredThreshold = 0.545; // Stable, trust the F1-curve
+                } else {
+                  requiredThreshold = 0.60; // General baseline
+                }
+
+                if (bestConf >= requiredThreshold) {
+                  // 3. TEMPORAL SMOOTHING (The Streak Filter with Forgiveness Buffer)
+                  if (bestLabel == _currentStreakClass) {
+                    _streakCount++;
+                    _missedFrames = 0; // Reset forgiveness buffer on a good match
+                  } else {
+                    // Different object detected. Should we forgive it?
+                    if (_streakCount > 0 && _missedFrames < 2) {
+                      _missedFrames++; // Forgive up to 2 bad frames
+                    } else {
+                      // Forgiveness exceeded or no streak yet, switch to new object
+                      _currentStreakClass = bestLabel;
+                      _streakCount = 1;
+                      _missedFrames = 0;
+                    }
+                  }
+
+                  // Force UI to show the real-time tracking Pill
+                  if (mounted) {
+                    setState(() {
+                      _currentStreakConf = bestConf;
+                    });
+                  }
+
+                  // Require exactly 4 consecutive frames (approx. ~0.6s at 6fps) of the SAME object
+                  if (_streakCount >= 4) {
+                    _liveDetectedClass = _currentStreakClass;
+                    _liveDetectedConf = bestConf;
+                    _lastDetectionTime = DateTime.now();
+                  }
+                } else {
+                  // If confidence drops below threshold (e.g. blurry frame), use forgiveness buffer
+                  if (_streakCount > 0 && _missedFrames < 2) {
+                    _missedFrames++;
+                  } else {
+                    // Instantly break the streak
+                    if (mounted) {
+                      setState(() {
+                        _streakCount = 0;
+                        _currentStreakClass = "";
+                        _currentStreakConf = 0.0;
+                        _missedFrames = 0;
+                      });
+                    }
+                  }
                 }
               },
             )
@@ -999,6 +1075,75 @@ class _ScannerPageState extends State<ScannerPage> {
                 : const Center(child: CircularProgressIndicator(color: brandGreen))))
                 : const Center(child: CircularProgressIndicator(color: brandGreen)),
           ),
+
+          // ==========================================
+          // LIVE TARGETING UI PILL
+          // ==========================================
+          if (!_isDialogShowing && _useNativeYoloView && _currentStreakClass.isNotEmpty)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 90,
+              left: 0,
+              right: 0,
+              child: Center(
+                child: AnimatedContainer(
+                  duration: const Duration(milliseconds: 200),
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  decoration: BoxDecoration(
+                      color: _streakCount >= 4
+                          ? brandGreen.withValues(alpha: 0.95)
+                          : brandNavy.withValues(alpha: 0.85),
+                      borderRadius: BorderRadius.circular(30),
+                      border: Border.all(
+                        color: _streakCount >= 4 ? brandNavy : Colors.transparent,
+                        width: 2,
+                      ),
+                      boxShadow: [
+                        BoxShadow(
+                          color: Colors.black.withValues(alpha: 0.2),
+                          blurRadius: 10,
+                          offset: const Offset(0, 4),
+                        )
+                      ]
+                  ),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Icon(
+                        _streakCount >= 4 ? Icons.check_circle_rounded : Icons.sync_rounded,
+                        color: _streakCount >= 4 ? brandNavy : Colors.white,
+                        size: 16,
+                      ),
+                      const SizedBox(width: 8),
+                      Text(
+                        _currentStreakClass.replaceAll('_', ' ').toUpperCase(),
+                        style: TextStyle(
+                          color: _streakCount >= 4 ? brandNavy : Colors.white,
+                          fontWeight: FontWeight.w900,
+                          fontSize: 14,
+                          letterSpacing: 0.5,
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: _streakCount >= 4 ? brandNavy.withValues(alpha: 0.1) : brandGreen.withValues(alpha: 0.2),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: Text(
+                          "${(_currentStreakConf * 100).toStringAsFixed(0)}%",
+                          style: TextStyle(
+                            color: _streakCount >= 4 ? brandNavy : brandGreen,
+                            fontWeight: FontWeight.w900,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
 
           Positioned(
             top: 0,
@@ -1032,7 +1177,25 @@ class _ScannerPageState extends State<ScannerPage> {
                         ),
                       ),
                       IconButton(
-                        onPressed: () {}, // Native YOLOView flash controlled internally or omitted for simplicity
+                        onPressed: () async {
+                          // Bypass YOLO native constraints to force Hardware LED on
+                          try {
+                            if (_isFlashOn) {
+                              await TorchLight.disableTorch();
+                              setState(() => _isFlashOn = false);
+                            } else {
+                              await TorchLight.enableTorch();
+                              setState(() => _isFlashOn = true);
+                            }
+                          } catch (e) {
+                            debugPrint("Torch error: $e");
+                            if (mounted) {
+                              ScaffoldMessenger.of(context).showSnackBar(
+                                const SnackBar(content: Text("Flash not supported on this device.")),
+                              );
+                            }
+                          }
+                        },
                         icon: Icon(
                           _isFlashOn ? Icons.flash_on_rounded : Icons.flash_off_rounded,
                           color: _isFlashOn ? brandGreen : Colors.white,
@@ -1085,7 +1248,14 @@ class _ScannerPageState extends State<ScannerPage> {
                   TextButton(
                     // Prevent tapping while a pipeline is already running/starting
                     onPressed: _isAnalyzing ? null : () async {
-                      final XFile? image = await _picker.pickImage(source: ImageSource.gallery);
+                      final XFile? image = await _picker.pickImage(
+                        source: ImageSource.gallery,
+                        // Optimization 3: Hardware pre-scaling for uploaded images
+                        // Compresses the image using native Android hardware before Dart ever sees it!
+                        maxWidth: 1080,
+                        maxHeight: 1080,
+                        imageQuality: 85,
+                      );
                       if (image != null) {
                         _runPipeline(preSelectedImage: image);
                       }
@@ -1701,8 +1871,12 @@ class _SuccessPopup extends StatelessWidget {
 
 class _FailurePopup extends StatelessWidget {
   final VoidCallback onRetry;
+  final String message;
 
-  const _FailurePopup({required this.onRetry});
+  const _FailurePopup({
+    required this.onRetry,
+    required this.message,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1732,7 +1906,7 @@ class _FailurePopup extends StatelessWidget {
                 color: Colors.red.withValues(alpha: 0.1),
                 shape: BoxShape.circle,
               ),
-              child: const Icon(Icons.search_off_rounded, color: Colors.redAccent, size: 40),
+              child: const Icon(Icons.warning_rounded, color: Colors.redAccent, size: 40),
             ),
             const SizedBox(height: 24),
             const Text(
@@ -1744,13 +1918,14 @@ class _FailurePopup extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 12),
-            const Text(
-              "We couldn't identify this item. Please ensure it's within the frame and has good lighting.",
+            Text(
+              message,
               textAlign: TextAlign.center,
-              style: TextStyle(
+              style: const TextStyle(
                 color: Color(0xB32D3E50),
                 fontSize: 15,
                 fontWeight: FontWeight.w600,
+                height: 1.4,
               ),
             ),
             const SizedBox(height: 32),
