@@ -215,8 +215,9 @@ class UserProvider with ChangeNotifier {
     _dailyImpact += amount;
     _monthlyImpact += amount;
     
-    if (category == 'transport') _transportImpact += amount;
-    else if (category == 'energy') _energyImpact += amount;
+    if (category == 'transport') {
+      _transportImpact += amount;
+    } else if (category == 'energy') _energyImpact += amount;
     else if (category == 'shopping') _shoppingImpact += amount;
     else if (category == 'food') _foodImpact += amount;
     

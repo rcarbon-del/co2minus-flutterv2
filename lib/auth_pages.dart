@@ -1,8 +1,6 @@
-import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:provider/provider.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'user_provider.dart';
 
 class WelcomeScreen extends StatelessWidget {
@@ -489,7 +487,7 @@ class ForgotPasswordScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     const Color brandNavy = Color(0xFF2D3E50);
-    final _emailController = TextEditingController();
+    final emailController = TextEditingController();
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -545,7 +543,7 @@ class ForgotPasswordScreen extends StatelessWidget {
                       _AnimatedTextSlide(
                         delay: 300,
                         child: _SmokeyGlassTextField(
-                          controller: _emailController,
+                          controller: emailController,
                           hint: "Email Address",
                           icon: Icons.email_outlined,
                         ),
@@ -561,7 +559,7 @@ class ForgotPasswordScreen extends StatelessWidget {
                               textColor: Colors.white,
                               onPressed: () async {
                                 try {
-                                  await userProvider.resetPassword(_emailController.text);
+                                  await userProvider.resetPassword(emailController.text);
                                   ScaffoldMessenger.of(context).showSnackBar(
                                     const SnackBar(content: Text("Password reset email sent.")),
                                   );

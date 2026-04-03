@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 import 'dart:ui' as ui;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -19,8 +18,6 @@ import 'package:torch_light/torch_light.dart'; // Handles native hardware flash 
 import 'package:flutter_litert/flutter_litert.dart';
 import 'package:image/image.dart' as img;
 import 'package:ultralytics_yolo/ultralytics_yolo.dart';
-import 'package:ultralytics_yolo/yolo.dart';
-import 'package:ultralytics_yolo/yolo_view.dart';
 
 import 'user_provider.dart';
 
@@ -416,7 +413,7 @@ class _ScannerPageState extends State<ScannerPage> {
       if (preSelectedImage != null) {
         // --- MANUAL UPLOAD LOGIC ---
         _emitUpdate(5, "1. Image Upload", "Safely allocating memory...");
-        finalImagePath = preSelectedImage!.path; // Added '!' here too just in case
+        finalImagePath = preSelectedImage.path; // Added '!' here too just in case
 
         // Wait 2500ms for YOLOView to fully unmount before running static YOLO prediction
         // This prevents the SIGSEGV crash caused by GPU delegate memory conflicts!
